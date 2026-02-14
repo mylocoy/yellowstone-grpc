@@ -90,6 +90,10 @@ impl PluginInner {
                 .compare_exchange(retry_after, 0, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
             {
+                // Reset error counter here so the second guard below cannot
+                // falsely re-block the retry if record_shm_error races in
+                // from another thread between CAS and the guard check.
+                self.shm_consecutive_errors.store(0, Ordering::Relaxed);
                 log::warn!("shm write backoff elapsed, attempting writes again");
             }
         }
@@ -149,6 +153,11 @@ impl PluginInner {
     }
 
     fn record_shm_error(&self, message: &str) {
+        let prev = self.shm_consecutive_errors.load(Ordering::Relaxed);
+        if prev >= Self::SHM_MAX_CONSECUTIVE_ERRORS {
+            // Already at threshold — skip increment to avoid unbounded growth.
+            return;
+        }
         let consecutive_errors = self.shm_consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
         if consecutive_errors == 1 {
             // Log only the first error in a streak to avoid log spam.

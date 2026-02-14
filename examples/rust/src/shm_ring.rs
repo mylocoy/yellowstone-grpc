@@ -514,6 +514,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_legacy_v1_frame_decode() {
+        let payload = encode_test_account_frame_v1();
+        let frame = decode_account_frame(&payload).expect("v1 decode should succeed");
+        assert_eq!(frame.sequence, 7);
+        assert_eq!(frame.slot, 42);
+        assert_eq!(frame.write_version, 99);
+        assert_eq!(frame.lamports, 123_456);
+        assert_eq!(frame.pubkey, [1u8; 32]);
+        assert_eq!(frame.owner, [2u8; 32]);
+        assert!(frame.executable);
+        assert!(!frame.is_startup);
+        assert_eq!(frame.txn_signature, Some([3u8; 64]));
+        assert_eq!(frame.data, vec![7, 8, 9]);
+    }
+
+    /// Encode a v1 frame (no CRC32 suffix).
+    fn encode_test_account_frame_v1() -> Vec<u8> {
+        let mut payload = Vec::new();
+        let flags = super::FLAG_EXECUTABLE | super::FLAG_HAS_TXN_SIGNATURE;
+        payload.extend_from_slice(&ACCOUNT_FRAME_KIND.to_le_bytes());
+        payload.extend_from_slice(&flags.to_le_bytes());
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&1_700_000_000_123_456_789u64.to_le_bytes());
+        payload.extend_from_slice(&42u64.to_le_bytes());
+        payload.extend_from_slice(&99u64.to_le_bytes());
+        payload.extend_from_slice(&123_456u64.to_le_bytes());
+        payload.extend_from_slice(&12u64.to_le_bytes());
+        payload.extend_from_slice(&[1u8; 32]);
+        payload.extend_from_slice(&[2u8; 32]);
+        payload.extend_from_slice(&[3u8; 64]);
+        payload.extend_from_slice(&(3u32).to_le_bytes());
+        payload.extend_from_slice(&[7u8, 8u8, 9u8]);
+        // No CRC32 — v1 legacy format
+        payload
+    }
+
     fn encode_test_account_frame() -> Vec<u8> {
         let mut payload = Vec::new();
         let flags = super::FLAG_EXECUTABLE | super::FLAG_HAS_TXN_SIGNATURE;
