@@ -58,6 +58,8 @@ pub struct PosixShmRingWriter {
     capacity: usize,
 }
 
+unsafe impl Send for PosixShmRingWriter {}
+
 impl PosixShmRingWriter {
     pub fn create(config: &ConfigGrpcShm) -> anyhow::Result<Self> {
         let name = normalize_name(&config.name)?;
@@ -195,6 +197,7 @@ impl PosixShmRingWriter {
     }
 
     fn initialize_header(&mut self) {
+        let capacity = self.capacity as u64;
         self.mmap_slice_mut()[..HEADER_BYTES].fill(0);
         self.mmap_slice_mut()[OFFSET_MAGIC..OFFSET_MAGIC + HEADER_MAGIC.len()]
             .copy_from_slice(&HEADER_MAGIC);
@@ -204,7 +207,7 @@ impl PosixShmRingWriter {
             OFFSET_HEADER_BYTES,
             HEADER_BYTES as u32,
         );
-        store_u64(self.mmap_slice_mut(), OFFSET_CAPACITY, self.capacity as u64);
+        store_u64(self.mmap_slice_mut(), OFFSET_CAPACITY, capacity);
         atomic_u64_mut(self.mmap_slice_mut(), OFFSET_WRITE_POS).store(0, Ordering::Relaxed);
         atomic_u64_mut(self.mmap_slice_mut(), OFFSET_TAIL_POS).store(0, Ordering::Relaxed);
         atomic_u64_mut(self.mmap_slice_mut(), OFFSET_DROPPED_RECORDS).store(0, Ordering::Relaxed);
@@ -246,7 +249,8 @@ impl PosixShmRingWriter {
     }
 
     fn write_ring_bytes(&mut self, absolute_offset: u64, data: &[u8]) {
-        copy_into_ring(self.mmap_slice_mut(), self.capacity, absolute_offset, data);
+        let capacity = self.capacity;
+        copy_into_ring(self.mmap_slice_mut(), capacity, absolute_offset, data);
     }
 
     fn read_u32_at(&self, absolute_offset: u64) -> anyhow::Result<u32> {

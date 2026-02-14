@@ -3,6 +3,7 @@ use {
         config::Config,
         grpc::GrpcService,
         metrics::{self, PrometheusService},
+        parallel::ParallelEncoder,
         shm::{AccountFrameInput, PosixShmRingWriter},
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
@@ -169,8 +170,12 @@ impl GeyserPlugin for Plugin {
             .unwrap_or(false);
         let shm_writer = match &config.grpc.shm {
             Some(shm_config) => {
-                let shm_writer = PosixShmRingWriter::create(shm_config)
-                    .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
+                let shm_writer = PosixShmRingWriter::create(shm_config).map_err(|error| {
+                    GeyserPluginError::Custom(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{error:?}"),
+                    )))
+                })?;
                 log::info!(
                     "shm output enabled: name={} path={} ring_bytes={} mode={:o} reset_on_start={} disable_grpc_accounts={}",
                     shm_writer.shm_name(),
@@ -213,6 +218,18 @@ impl GeyserPlugin for Plugin {
         let prometheus_task_tracker = plugin_task_tracker.clone();
         let grpc_cancellation_token = plugin_cancellation_token.child_token();
         let grpc_task_tracker = plugin_task_tracker.clone();
+        let parallel_encoder_threads = config
+            .tokio
+            .worker_threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1)
+            })
+            .max(1);
+        let (parallel_encoder, _parallel_encoder_handle) =
+            ParallelEncoder::new(parallel_encoder_threads);
+        log::info!("parallel encoder enabled with {parallel_encoder_threads} threads");
 
         let runtime = builder
             .thread_name_fn(crate::get_thread_name)
@@ -238,9 +255,15 @@ impl GeyserPlugin for Plugin {
                 is_reload,
                 grpc_cancellation_token,
                 grpc_task_tracker,
+                parallel_encoder,
             )
             .await
-            .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
+            .map_err(|error| {
+                GeyserPluginError::Custom(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("{error:?}"),
+                )))
+            })?;
             Ok::<_, GeyserPluginError>((snapshot_channel, grpc_channel))
         });
 
