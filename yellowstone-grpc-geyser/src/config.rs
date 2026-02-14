@@ -182,6 +182,9 @@ pub struct ConfigGrpc {
     pub filter_limits: FilterLimits,
     /// x_token to enforce on connections
     pub x_token: Option<String>,
+    /// Optional POSIX shared memory output for account updates
+    #[serde(default)]
+    pub shm: Option<ConfigGrpcShm>,
     /// Optional static allowlist for account owners.
     /// If configured with one or more values, only accounts with matching owner
     /// are forwarded into the gRPC processing pipeline.
@@ -252,6 +255,45 @@ impl ConfigGrpc {
 
     const fn default_replay_stored_slots() -> u64 {
         0
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfigGrpcShm {
+    /// POSIX shared memory object name for `shm_open`, e.g. `/yellowstone_accounts`
+    pub name: String,
+    /// Ring bytes excluding shared-memory header
+    #[serde(
+        default = "ConfigGrpcShm::default_ring_bytes",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub ring_bytes: usize,
+    /// POSIX mode for `shm_open`, supports decimal or octal string like `0o600`
+    #[serde(
+        default = "ConfigGrpcShm::default_mode",
+        deserialize_with = "deserialize_mode"
+    )]
+    pub mode: u32,
+    /// Reset ring header and pointers on plugin startup
+    #[serde(default = "ConfigGrpcShm::default_reset_on_start")]
+    pub reset_on_start: bool,
+    /// Do not forward account updates into gRPC pipeline after writing to shm
+    #[serde(default)]
+    pub disable_grpc_accounts: bool,
+}
+
+impl ConfigGrpcShm {
+    const fn default_ring_bytes() -> usize {
+        64 * 1024 * 1024
+    }
+
+    const fn default_mode() -> u32 {
+        0o600
+    }
+
+    const fn default_reset_on_start() -> bool {
+        true
     }
 }
 
@@ -369,6 +411,30 @@ where
     }
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ValueMode<'a> {
+    Int(u32),
+    Str(&'a str),
+}
+
+fn deserialize_mode<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match ValueMode::deserialize(deserializer)? {
+        ValueMode::Int(value) => Ok(value),
+        ValueMode::Str(value) => {
+            let value = value.replace('_', "");
+            if let Some(octal) = value.strip_prefix("0o") {
+                u32::from_str_radix(octal, 8).map_err(de::Error::custom)
+            } else {
+                value.parse::<u32>().map_err(de::Error::custom)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {solana_pubkey::Pubkey, std::collections::HashSet};
@@ -419,5 +485,26 @@ mod tests {
         let json = r#"{}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.pubkeys.is_empty());
+    }
+
+    #[test]
+    fn test_deser_mode() {
+        #[derive(serde::Deserialize)]
+        struct Config {
+            #[serde(deserialize_with = "super::deserialize_mode")]
+            mode: u32,
+        }
+
+        let json = r#"{"mode":"0o600"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mode, 0o600);
+
+        let json = r#"{"mode":"384"}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mode, 0o600);
+
+        let json = r#"{"mode":384}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.mode, 0o600);
     }
 }

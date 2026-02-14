@@ -3,20 +3,21 @@ use {
         config::Config,
         grpc::GrpcService,
         metrics::{self, PrometheusService},
+        shm::{AccountFrameInput, PosixShmRingWriter},
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-        ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
-        SlotStatus,
+        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoV3, ReplicaAccountInfoVersions,
+        ReplicaBlockInfoVersions, ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions,
+        Result as PluginResult, SlotStatus,
     },
     std::{
         collections::HashSet,
         concat, env,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex,
         },
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::{
         runtime::{Builder, Runtime},
@@ -35,6 +36,10 @@ pub struct PluginInner {
     snapshot_channel_closed: AtomicBool,
     grpc_channel: mpsc::UnboundedSender<Message>,
     static_owner_allowlist: Option<HashSet<[u8; 32]>>,
+    shm_writer: Option<Mutex<PosixShmRingWriter>>,
+    shm_sequence: AtomicU64,
+    shm_write_failed: AtomicBool,
+    shm_disable_grpc_accounts: bool,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
 }
@@ -52,6 +57,66 @@ impl PluginInner {
                 .map(|owner| allowlist.contains(owner))
                 .unwrap_or(false),
             None => true,
+        }
+    }
+
+    fn write_account_to_shm(
+        &self,
+        account: &ReplicaAccountInfoV3<'_>,
+        slot: u64,
+        is_startup: bool,
+    ) {
+        let Some(shm_writer) = &self.shm_writer else {
+            return;
+        };
+        if self.shm_write_failed.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let Ok(pubkey) = <[u8; 32]>::try_from(account.pubkey) else {
+            self.mark_shm_failed("invalid pubkey length in account update".to_owned());
+            return;
+        };
+        let Ok(owner) = <[u8; 32]>::try_from(account.owner) else {
+            self.mark_shm_failed("invalid owner length in account update".to_owned());
+            return;
+        };
+        let txn_signature = account
+            .txn
+            .and_then(|txn| <[u8; 64]>::try_from(txn.signature().as_ref()).ok());
+
+        let created_at_unix_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        let sequence = self.shm_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let Ok(mut writer) = shm_writer.lock() else {
+            self.mark_shm_failed("failed to lock shm writer".to_owned());
+            return;
+        };
+
+        if let Err(error) = writer.push_account_frame(AccountFrameInput {
+            sequence,
+            created_at_unix_nanos,
+            slot,
+            write_version: account.write_version,
+            lamports: account.lamports,
+            rent_epoch: account.rent_epoch,
+            pubkey,
+            owner,
+            executable: account.executable,
+            is_startup,
+            txn_signature,
+            data: account.data,
+        }) {
+            self.mark_shm_failed(format!("failed to write account update to shm: {error:?}"));
+        }
+    }
+
+    fn mark_shm_failed(&self, error: String) {
+        if !self.shm_write_failed.swap(true, Ordering::Relaxed) {
+            log::error!("{error}");
         }
     }
 }
@@ -84,6 +149,10 @@ impl GeyserPlugin for Plugin {
 
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
+
+        solana_logger::setup_with_default(&config.log.level);
+        log::info!("loading plugin: {}", self.name());
+
         let static_owner_allowlist = (!config.grpc.static_owner_allowlist.is_empty()).then(|| {
             config
                 .grpc
@@ -92,16 +161,37 @@ impl GeyserPlugin for Plugin {
                 .map(|owner| owner.to_bytes())
                 .collect::<HashSet<_>>()
         });
-
-        // Setup logger
-        solana_logger::setup_with_default(&config.log.level);
-
-        log::info!("loading plugin: {}", self.name());
+        let shm_disable_grpc_accounts = config
+            .grpc
+            .shm
+            .as_ref()
+            .map(|shm| shm.disable_grpc_accounts)
+            .unwrap_or(false);
+        let shm_writer = match &config.grpc.shm {
+            Some(shm_config) => {
+                let shm_writer = PosixShmRingWriter::create(shm_config)
+                    .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
+                log::info!(
+                    "shm output enabled: name={} path={} ring_bytes={} mode={:o} reset_on_start={} disable_grpc_accounts={}",
+                    shm_writer.shm_name(),
+                    shm_writer.shm_path(),
+                    shm_config.ring_bytes,
+                    shm_config.mode,
+                    shm_config.reset_on_start,
+                    shm_config.disable_grpc_accounts
+                );
+                Some(Mutex::new(shm_writer))
+            }
+            None => None,
+        };
         if let Some(allowlist) = &static_owner_allowlist {
             log::info!(
                 "static owner allowlist enabled with {} owners",
                 allowlist.len()
             );
+        }
+        if shm_disable_grpc_accounts {
+            log::warn!("gRPC account forwarding disabled; account updates are available only via shm output");
         }
 
         // Reset metrics to prevent accumulation across plugin reload cycles
@@ -165,6 +255,10 @@ impl GeyserPlugin for Plugin {
             snapshot_channel_closed: AtomicBool::new(false),
             grpc_channel,
             static_owner_allowlist,
+            shm_writer,
+            shm_sequence: AtomicU64::new(0),
+            shm_write_failed: AtomicBool::new(false),
+            shm_disable_grpc_accounts,
             plugin_cancellation_token,
             plugin_task_tracker,
         });
@@ -207,6 +301,10 @@ impl GeyserPlugin for Plugin {
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
             if !inner.is_account_owner_allowed(account.owner) {
+                return Ok(());
+            }
+            inner.write_account_to_shm(account, slot, is_startup);
+            if inner.shm_disable_grpc_accounts {
                 return Ok(());
             }
 

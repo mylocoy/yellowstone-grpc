@@ -50,6 +50,8 @@ If all fields are empty, then all accounts are broadcast. Otherwise, fields work
 
 If you only need a fixed set of owners, you can pre-filter account updates in plugin config with `grpc.static_owner_allowlist`. This is applied before messages enter the gRPC pipeline and helps reduce CPU and queue pressure.
 
+For lower-latency local consumption, you can also enable `grpc.shm` and stream account updates into a POSIX shared-memory ring (`shm_open`). A bot process can then read from `/dev/shm/<name_without_leading_slash>`.
+
 #### Transactions
 
    - `vote` — enable/disable broadcast `vote` transactions
@@ -82,6 +84,13 @@ It's possible to add limits for filters in the config. If the `filters` field is
 
 ```json
 "grpc": {
+   "shm": {
+      "name": "/yellowstone_accounts",
+      "ring_bytes": "67_108_864",
+      "mode": "0o600",
+      "reset_on_start": true,
+      "disable_grpc_accounts": false
+   },
    "static_owner_allowlist": [
       "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
    ],
@@ -124,6 +133,8 @@ It's possible to add limits for filters in the config. If the `filters` field is
 }
 ```
 
+If `disable_grpc_accounts` is `true`, account updates are written only to shared memory and are no longer available in gRPC account subscriptions.
+
 ### Unary gRPC methods
 
 #### Ping
@@ -153,3 +164,80 @@ You can see in the rust example how to reply to the ping from the server with th
 ### Projects based on Geyser gRPC
 
 - https://github.com/rpcpool/yellowstone-grpc-kafka — forward gRPC stream to Kafka, dedup, read stream from Kafka with gRPC server
+
+
+
+
+给你一份“服务端集成 POSIX SHM”的完整落地流程（按你现在这套代码）。
+
+  代码已就位（你无需再改逻辑）
+
+  - 配置入口：yellowstone-grpc-geyser/src/config.rs:187、yellowstone-grpc-geyser/src/config.rs:263
+  - 写入入口：yellowstone-grpc-geyser/src/plugin.rs:287、yellowstone-grpc-geyser/src/plugin.rs:306
+  - POSIX SHM 实现：yellowstone-grpc-geyser/src/shm.rs:62
+  - /dev/shm 映射规则：yellowstone-grpc-geyser/src/shm.rs:138
+
+  1) 在 Linux 服务器编译插件
+
+  - 建议直接在 validator 机器编译（macOS 上 affinity 依赖会报错）：
+  - cargo build --release -p yellowstone-grpc-geyser
+  - 产物路径通常是：target/release/libyellowstone_grpc_geyser.so
+
+  2) 修改 geyser 插件配置
+  在你的插件配置（如 yellowstone-grpc-geyser/config.json）里把 grpc.shm 打开（当前默认是 null，见 yellowstone-grpc-
+  geyser/config.json:32）：
+
+  "grpc": {
+    "shm": {
+      "name": "/yellowstone_accounts",
+      "ring_bytes": "268_435_456",
+      "mode": "0o600",
+      "reset_on_start": true,
+      "disable_grpc_accounts": false
+    },
+    "static_owner_allowlist": [
+      "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+    ]
+  }
+
+  字段含义：
+
+  - name: POSIX shm 名称（建议以 / 开头）
+  - ring_bytes: ring 数据区大小（不含 4KB header）
+  - mode: 权限（0o600 推荐）
+  - reset_on_start: 启动时是否清空 ring
+  - disable_grpc_accounts: true 时账户更新只写 SHM，不再走 gRPC 账户流（README.md:136）
+
+  3) 验证配置合法
+
+  - cargo run -p yellowstone-grpc-geyser --bin config-check -- --config /path/to/config.json
+
+  4) 启动 validator
+
+  - solana-validator --geyser-plugin-config /path/to/config.json
+
+  5) 启动后检查
+
+  - 日志里应出现 shm output enabled（yellowstone-grpc-geyser/src/plugin.rs:175）
+  - 检查 shm 文件：
+      - ls -lh /dev/shm/yellowstone_accounts
+      - 文件大小应约等于 4096 + ring_bytes
+
+  6) bot 读取（你现成可用）
+
+  - 示例 reader：
+  - cargo run -p yellowstone-grpc-client-simple --bin shm-reader -- --shm-name "/yellowstone_accounts"
+  - 去重默认开启（按 slot + write_version），实现见 examples/rust/src/bin/shm-reader.rs:86
+
+  7) 建议切换策略（强烈建议）
+
+  - 第一步先设 disable_grpc_accounts=false，跑一段时间对账稳定性
+  - 第二步再切到 true，彻底走 SHM 低延迟路径
+
+  8) 关键风险提示
+
+  - 若日志出现 failed to write account update to shm，写入会被标记失败并停止；若此时 disable_grpc_accounts=true，你会丢
+    账户更新。
+  - 所以生产建议先双轨运行（gRPC+SHM），确认稳定再关 gRPC 账户流。
+
+  如果你要，我下一条可以直接给你一个“按你的实际 TPS/平均 account 大小”计算 ring_bytes 的推荐值表。
