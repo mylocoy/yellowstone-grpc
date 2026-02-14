@@ -1,6 +1,7 @@
 use {
     crate::config::ConfigGrpcShm,
     anyhow::{anyhow, bail, Context},
+    crc32fast::Hasher as Crc32Hasher,
     libc::{
         c_int, c_void, close, fstat, ftruncate, mmap, mode_t, munmap, off_t, shm_open, MAP_FAILED,
         MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE,
@@ -13,6 +14,11 @@ use {
     },
 };
 
+// ── Ring buffer wire format constants ──────────────────────────────────────
+// IMPORTANT: These values define the cross-process ABI between the geyser
+// plugin (writer) and external readers (e.g. examples/rust/src/shm_ring.rs).
+// Any change here MUST be mirrored in the reader side.
+// ───────────────────────────────────────────────────────────────────────────
 const HEADER_BYTES: usize = 4096;
 const HEADER_MAGIC: [u8; 8] = *b"YGRING01";
 const HEADER_VERSION: u32 = 1;
@@ -27,7 +33,12 @@ const OFFSET_DROPPED_RECORDS: usize = 40;
 const OFFSET_WRITTEN_RECORDS: usize = 48;
 
 const ACCOUNT_FRAME_KIND: u16 = 1;
-const ACCOUNT_FRAME_FIXED_BYTES: usize = 184;
+/// Fixed-size portion of an account frame (before variable-length `data`):
+///   kind(2) + flags(2) + sequence(8) + nanos(8) + slot(8) + write_version(8)
+///   + lamports(8) + rent_epoch(8) + pubkey(32) + owner(32) + txn_sig(64) + data_len(4)
+const ACCOUNT_FRAME_FIXED_BYTES: usize = 2 + 2 + 8 + 8 + 8 + 8 + 8 + 8 + 32 + 32 + 64 + 4;
+// Static assert: ensure the computed value matches the expected layout.
+const _: () = assert!(ACCOUNT_FRAME_FIXED_BYTES == 184);
 
 const FLAG_IS_STARTUP: u16 = 1 << 0;
 const FLAG_EXECUTABLE: u16 = 1 << 1;
@@ -58,6 +69,12 @@ pub struct PosixShmRingWriter {
     capacity: usize,
 }
 
+// SAFETY: PosixShmRingWriter owns the fd and mmap_ptr exclusively.
+// Transferring ownership to another thread (Send) is safe because:
+// 1. The raw pointer `mmap_ptr` is only accessed through `&mut self` methods.
+// 2. The struct is always wrapped in `Mutex` in the plugin, ensuring exclusive access.
+// Note: PosixShmRingWriter must NOT implement Sync — concurrent `&self` access
+// to the mmap region would be a data race.
 unsafe impl Send for PosixShmRingWriter {}
 
 impl PosixShmRingWriter {
@@ -137,8 +154,16 @@ impl PosixShmRingWriter {
         &self.name
     }
 
+    /// Returns the filesystem path for this SHM object.
+    /// Only valid on Linux where POSIX SHM is backed by `/dev/shm`.
+    #[cfg(target_os = "linux")]
     pub fn shm_path(&self) -> String {
         format!("/dev/shm/{}", self.name.trim_start_matches('/'))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn shm_path(&self) -> String {
+        format!("<platform-specific>:{}", self.name)
     }
 
     pub fn push_account_frame(&mut self, frame: AccountFrameInput<'_>) -> anyhow::Result<()> {
@@ -159,10 +184,18 @@ impl PosixShmRingWriter {
         let capacity_u64 = self.capacity as u64;
         let write_pos = self.load_write_pos();
         let mut tail_pos = self.load_tail_pos();
-        let next_write = write_pos + record_len as u64;
+        let next_write = write_pos.checked_add(record_len as u64).context(
+            "write_pos overflow: ring buffer absolute offset exhausted",
+        )?;
+
+        // Guard against corrupted tail_pos (e.g. after crash or external tampering).
+        // If tail_pos is ahead of write_pos, reset it to make forward progress.
+        if tail_pos > write_pos {
+            tail_pos = write_pos;
+        }
 
         let mut dropped_records = 0u64;
-        while next_write - tail_pos > capacity_u64 {
+        while next_write.saturating_sub(tail_pos) > capacity_u64 {
             if tail_pos >= write_pos {
                 tail_pos = next_write - capacity_u64;
                 dropped_records += 1;
@@ -190,6 +223,10 @@ impl PosixShmRingWriter {
 
         self.write_ring_bytes(write_pos, &payload_len.to_le_bytes());
         self.write_ring_bytes(write_pos + 4, payload);
+        // Release-store on write_pos acts as the publish barrier: the reader
+        // performs an Acquire-load on the same location (plus an explicit fence
+        // on non-TSO architectures) to ensure all ring data written above is
+        // visible before the updated write_pos.
         self.store_write_pos(next_write);
         self.fetch_add_written_records(1);
 
@@ -346,7 +383,8 @@ fn verify_header(mmap: &[u8]) -> anyhow::Result<usize> {
 
 fn encode_account_frame(frame: AccountFrameInput<'_>) -> anyhow::Result<Vec<u8>> {
     let data_len = u32::try_from(frame.data.len()).context("account data is larger than 4GiB")?;
-    let mut payload = Vec::with_capacity(ACCOUNT_FRAME_FIXED_BYTES + frame.data.len());
+    // +4 for trailing CRC32
+    let mut payload = Vec::with_capacity(ACCOUNT_FRAME_FIXED_BYTES + frame.data.len() + 4);
     payload.extend_from_slice(&ACCOUNT_FRAME_KIND.to_le_bytes());
 
     let mut flags = 0u16;
@@ -371,6 +409,12 @@ fn encode_account_frame(frame: AccountFrameInput<'_>) -> anyhow::Result<Vec<u8>>
     payload.extend_from_slice(&frame.txn_signature.unwrap_or([0u8; 64]));
     payload.extend_from_slice(&data_len.to_le_bytes());
     payload.extend_from_slice(frame.data);
+
+    // Append CRC32 checksum over the entire payload for integrity verification.
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(&payload);
+    payload.extend_from_slice(&hasher.finalize().to_le_bytes());
+
     Ok(payload)
 }
 

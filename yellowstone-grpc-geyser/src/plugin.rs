@@ -39,7 +39,8 @@ pub struct PluginInner {
     static_owner_allowlist: Option<HashSet<[u8; 32]>>,
     shm_writer: Option<Mutex<PosixShmRingWriter>>,
     shm_sequence: AtomicU64,
-    shm_write_failed: AtomicBool,
+    /// Consecutive SHM write error count. Reset to 0 on success.
+    shm_consecutive_errors: AtomicU64,
     shm_disable_grpc_accounts: bool,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
@@ -61,6 +62,9 @@ impl PluginInner {
         }
     }
 
+    /// Maximum consecutive SHM write errors before disabling writes for good.
+    const SHM_MAX_CONSECUTIVE_ERRORS: u64 = 64;
+
     fn write_account_to_shm(
         &self,
         account: &ReplicaAccountInfoV3<'_>,
@@ -70,16 +74,17 @@ impl PluginInner {
         let Some(shm_writer) = &self.shm_writer else {
             return;
         };
-        if self.shm_write_failed.load(Ordering::Relaxed) {
+        // Skip if too many consecutive errors have accumulated.
+        if self.shm_consecutive_errors.load(Ordering::Relaxed) >= Self::SHM_MAX_CONSECUTIVE_ERRORS {
             return;
         }
 
         let Ok(pubkey) = <[u8; 32]>::try_from(account.pubkey) else {
-            self.mark_shm_failed("invalid pubkey length in account update".to_owned());
+            self.record_shm_error("invalid pubkey length in account update");
             return;
         };
         let Ok(owner) = <[u8; 32]>::try_from(account.owner) else {
-            self.mark_shm_failed("invalid owner length in account update".to_owned());
+            self.record_shm_error("invalid owner length in account update");
             return;
         };
         let txn_signature = account
@@ -93,11 +98,11 @@ impl PluginInner {
         let sequence = self.shm_sequence.fetch_add(1, Ordering::Relaxed) + 1;
 
         let Ok(mut writer) = shm_writer.lock() else {
-            self.mark_shm_failed("failed to lock shm writer".to_owned());
+            self.record_shm_error("failed to lock shm writer (poisoned)");
             return;
         };
 
-        if let Err(error) = writer.push_account_frame(AccountFrameInput {
+        match writer.push_account_frame(AccountFrameInput {
             sequence,
             created_at_unix_nanos,
             slot,
@@ -111,13 +116,27 @@ impl PluginInner {
             txn_signature,
             data: account.data,
         }) {
-            self.mark_shm_failed(format!("failed to write account update to shm: {error:?}"));
+            Ok(()) => {
+                // Reset error counter on success.
+                self.shm_consecutive_errors.store(0, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.record_shm_error(&format!("shm write failed: {error:?}"));
+            }
         }
     }
 
-    fn mark_shm_failed(&self, error: String) {
-        if !self.shm_write_failed.swap(true, Ordering::Relaxed) {
-            log::error!("{error}");
+    fn record_shm_error(&self, message: &str) {
+        let prev = self.shm_consecutive_errors.fetch_add(1, Ordering::Relaxed);
+        if prev == 0 {
+            // Log only the first error in a streak to avoid log spam.
+            log::error!("{message}");
+        }
+        if prev + 1 == Self::SHM_MAX_CONSECUTIVE_ERRORS {
+            log::error!(
+                "shm write disabled after {} consecutive errors",
+                Self::SHM_MAX_CONSECUTIVE_ERRORS
+            );
         }
     }
 }
@@ -280,7 +299,7 @@ impl GeyserPlugin for Plugin {
             static_owner_allowlist,
             shm_writer,
             shm_sequence: AtomicU64::new(0),
-            shm_write_failed: AtomicBool::new(false),
+            shm_consecutive_errors: AtomicU64::new(0),
             shm_disable_grpc_accounts,
             plugin_cancellation_token,
             plugin_task_tracker,

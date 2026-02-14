@@ -1,5 +1,6 @@
 use {
     anyhow::{bail, Context},
+    crc32fast::Hasher as Crc32Hasher,
     memmap2::{Mmap, MmapOptions},
     std::{
         fs::OpenOptions,
@@ -11,6 +12,10 @@ use {
 
 pub const DEFAULT_POSIX_SHM_NAME: &str = "/yellowstone_accounts";
 
+// ── Ring buffer wire format constants ──────────────────────────────────────
+// IMPORTANT: These values must match the writer side in
+// yellowstone-grpc-geyser/src/shm.rs. Any change there MUST be mirrored here.
+// ───────────────────────────────────────────────────────────────────────────
 const HEADER_BYTES: usize = 4096;
 const HEADER_MAGIC: [u8; 8] = *b"YGRING01";
 const HEADER_VERSION: u32 = 1;
@@ -25,7 +30,11 @@ const OFFSET_DROPPED_RECORDS: usize = 40;
 const OFFSET_WRITTEN_RECORDS: usize = 48;
 
 pub const ACCOUNT_FRAME_KIND: u16 = 1;
-const ACCOUNT_FRAME_FIXED_BYTES: usize = 184;
+/// Fixed-size portion of an account frame (before variable-length `data`):
+///   kind(2) + flags(2) + sequence(8) + nanos(8) + slot(8) + write_version(8)
+///   + lamports(8) + rent_epoch(8) + pubkey(32) + owner(32) + txn_sig(64) + data_len(4)
+const ACCOUNT_FRAME_FIXED_BYTES: usize = 2 + 2 + 8 + 8 + 8 + 8 + 8 + 8 + 32 + 32 + 64 + 4;
+const _: () = assert!(ACCOUNT_FRAME_FIXED_BYTES == 184);
 
 const FLAG_IS_STARTUP: u16 = 1 << 0;
 const FLAG_EXECUTABLE: u16 = 1 << 1;
@@ -93,6 +102,12 @@ impl SharedRingReader {
     }
 
     pub fn next_payload(&mut self) -> anyhow::Result<Option<Vec<u8>>> {
+        // Cross-process memory fence: ensure all prior writes from the writer
+        // process are visible to this reader before we inspect positions.
+        // On x86_64 (TSO) this is essentially a no-op, but on ARM (aarch64)
+        // it emits the necessary barrier instruction.
+        std::sync::atomic::fence(Ordering::Acquire);
+
         let tail_pos = self.load_tail_pos();
         if self.cursor < tail_pos {
             self.cursor = tail_pos;
@@ -173,40 +188,61 @@ impl SharedRingReader {
     }
 }
 
+/// CRC32 tail size in bytes (appended by the writer after the frame body).
+const CRC32_TAIL_BYTES: usize = 4;
+
 pub fn decode_account_frame(payload: &[u8]) -> anyhow::Result<AccountFrame> {
-    if payload.len() < ACCOUNT_FRAME_FIXED_BYTES {
+    // Minimum: fixed header + CRC32 tail (data may be zero-length).
+    if payload.len() < ACCOUNT_FRAME_FIXED_BYTES + CRC32_TAIL_BYTES {
         bail!(
-            "invalid account frame: len {} < fixed header {}",
+            "invalid account frame: len {} < minimum {}",
             payload.len(),
-            ACCOUNT_FRAME_FIXED_BYTES
+            ACCOUNT_FRAME_FIXED_BYTES + CRC32_TAIL_BYTES
         );
     }
 
+    // Verify CRC32: the last 4 bytes are the checksum over everything before them.
+    let (body, crc_bytes) = payload.split_at(payload.len() - CRC32_TAIL_BYTES);
+    let stored_crc = u32::from_le_bytes(
+        crc_bytes
+            .try_into()
+            .context("failed to read CRC32 from payload tail")?,
+    );
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(body);
+    let computed_crc = hasher.finalize();
+    if stored_crc != computed_crc {
+        bail!(
+            "CRC32 mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x} (payload corrupt or partially written)"
+        );
+    }
+
+    // Decode the body (everything except the trailing CRC32).
     let mut offset = 0usize;
-    let kind = decode_u16(payload, &mut offset)?;
+    let kind = decode_u16(body, &mut offset)?;
     if kind != ACCOUNT_FRAME_KIND {
         bail!("unexpected frame kind: {kind}");
     }
-    let flags = decode_u16(payload, &mut offset)?;
-    let sequence = decode_u64(payload, &mut offset)?;
-    let created_at_unix_nanos = decode_u64(payload, &mut offset)?;
-    let slot = decode_u64(payload, &mut offset)?;
-    let write_version = decode_u64(payload, &mut offset)?;
-    let lamports = decode_u64(payload, &mut offset)?;
-    let rent_epoch = decode_u64(payload, &mut offset)?;
-    let pubkey = decode_fixed::<32>(payload, &mut offset)?;
-    let owner = decode_fixed::<32>(payload, &mut offset)?;
-    let txn_signature_raw = decode_fixed::<64>(payload, &mut offset)?;
-    let data_len = decode_u32(payload, &mut offset)? as usize;
-    let expected_len = ACCOUNT_FRAME_FIXED_BYTES + data_len;
-    if payload.len() != expected_len {
+    let flags = decode_u16(body, &mut offset)?;
+    let sequence = decode_u64(body, &mut offset)?;
+    let created_at_unix_nanos = decode_u64(body, &mut offset)?;
+    let slot = decode_u64(body, &mut offset)?;
+    let write_version = decode_u64(body, &mut offset)?;
+    let lamports = decode_u64(body, &mut offset)?;
+    let rent_epoch = decode_u64(body, &mut offset)?;
+    let pubkey = decode_fixed::<32>(body, &mut offset)?;
+    let owner = decode_fixed::<32>(body, &mut offset)?;
+    let txn_signature_raw = decode_fixed::<64>(body, &mut offset)?;
+    let data_len = decode_u32(body, &mut offset)? as usize;
+    let expected_body_len = ACCOUNT_FRAME_FIXED_BYTES + data_len;
+    if body.len() != expected_body_len {
         bail!(
-            "invalid account frame size: actual={} expected={expected_len}",
-            payload.len()
+            "invalid account frame size: actual={} expected={expected_body_len}",
+            body.len()
         );
     }
 
-    let data = payload[offset..].to_vec();
+    let data = body[offset..].to_vec();
     let txn_signature = if (flags & FLAG_HAS_TXN_SIGNATURE) == 0 {
         None
     } else {
@@ -229,6 +265,8 @@ pub fn decode_account_frame(payload: &[u8]) -> anyhow::Result<AccountFrame> {
     })
 }
 
+/// Convert a POSIX SHM name to its filesystem path.
+/// Only valid on Linux where `/dev/shm` is the backing tmpfs.
 pub fn posix_shm_name_to_path(name: &str) -> anyhow::Result<String> {
     if name.is_empty() {
         bail!("shm name must not be empty");
@@ -239,6 +277,9 @@ pub fn posix_shm_name_to_path(name: &str) -> anyhow::Result<String> {
     let normalized = name.strip_prefix('/').unwrap_or(name);
     if normalized.is_empty() {
         bail!("shm name must include non-slash characters");
+    }
+    if cfg!(not(target_os = "linux")) {
+        log::warn!("posix_shm_name_to_path assumes Linux /dev/shm; path may be incorrect on this platform");
     }
     Ok(format!("/dev/shm/{normalized}"))
 }
@@ -419,6 +460,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_crc32_corruption_detected() {
+        let mut payload = encode_test_account_frame();
+        // Corrupt one byte in the middle
+        let mid = payload.len() / 2;
+        payload[mid] ^= 0xFF;
+        let result = decode_account_frame(&payload);
+        assert!(result.is_err(), "corrupted payload should fail CRC check");
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("CRC32 mismatch"),
+            "error should mention CRC32: {err_msg}"
+        );
+    }
+
     fn encode_test_account_frame() -> Vec<u8> {
         let mut payload = Vec::new();
         let flags = super::FLAG_EXECUTABLE | super::FLAG_HAS_TXN_SIGNATURE;
@@ -435,6 +491,10 @@ mod tests {
         payload.extend_from_slice(&[3u8; 64]);
         payload.extend_from_slice(&(3u32).to_le_bytes());
         payload.extend_from_slice(&[7u8, 8u8, 9u8]);
+        // Append CRC32 to match writer format
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&payload);
+        payload.extend_from_slice(&hasher.finalize().to_le_bytes());
         payload
     }
 }

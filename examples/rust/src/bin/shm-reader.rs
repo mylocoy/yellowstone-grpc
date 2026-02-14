@@ -5,7 +5,6 @@ use {
     solana_pubkey::Pubkey,
     std::{
         collections::HashMap,
-        env,
         path::Path,
         time::{Duration, Instant},
     },
@@ -54,12 +53,13 @@ struct Args {
     disable_dedup: bool,
 }
 
+/// Maximum number of pubkeys tracked in the dedup map.
+/// When exceeded, the map is cleared to reclaim memory. On Solana mainnet
+/// there are ~300M accounts, so this caps memory at ~40 bytes * 2M ≈ 80 MB.
+const DEDUP_MAX_ENTRIES: usize = 2_000_000;
+
 fn main() -> anyhow::Result<()> {
-    env::set_var(
-        env_logger::DEFAULT_FILTER_ENV,
-        env::var_os(env_logger::DEFAULT_FILTER_ENV).unwrap_or_else(|| "info".into()),
-    );
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
     let shm_path = resolve_shm_path(&args)?;
@@ -96,6 +96,13 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     dedup_state.insert(frame.pubkey, (frame.slot, frame.write_version));
+                    if dedup_state.len() > DEDUP_MAX_ENTRIES {
+                        info!(
+                            "dedup map exceeded {} entries, clearing",
+                            DEDUP_MAX_ENTRIES
+                        );
+                        dedup_state.clear();
+                    }
                 }
 
                 interval_messages += 1;
