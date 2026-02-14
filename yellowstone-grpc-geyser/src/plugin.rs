@@ -3,7 +3,6 @@ use {
         config::Config,
         grpc::GrpcService,
         metrics::{self, PrometheusService},
-        parallel::ParallelEncoder,
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
@@ -11,6 +10,7 @@ use {
         SlotStatus,
     },
     std::{
+        collections::HashSet,
         concat, env,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -34,15 +34,24 @@ pub struct PluginInner {
     snapshot_channel: Mutex<Option<crossbeam_channel::Sender<Box<Message>>>>,
     snapshot_channel_closed: AtomicBool,
     grpc_channel: mpsc::UnboundedSender<Message>,
+    static_owner_allowlist: Option<HashSet<[u8; 32]>>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
-    encoder_handle: std::thread::JoinHandle<()>,
 }
 
 impl PluginInner {
     fn send_message(&self, message: Message) {
         if self.grpc_channel.send(message).is_ok() {
             metrics::message_queue_size_inc();
+        }
+    }
+
+    fn is_account_owner_allowed(&self, owner: &[u8]) -> bool {
+        match &self.static_owner_allowlist {
+            Some(allowlist) => <&[u8; 32]>::try_from(owner)
+                .map(|owner| allowlist.contains(owner))
+                .unwrap_or(false),
+            None => true,
         }
     }
 }
@@ -75,11 +84,25 @@ impl GeyserPlugin for Plugin {
 
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
+        let static_owner_allowlist = (!config.grpc.static_owner_allowlist.is_empty()).then(|| {
+            config
+                .grpc
+                .static_owner_allowlist
+                .iter()
+                .map(|owner| owner.to_bytes())
+                .collect::<HashSet<_>>()
+        });
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
 
         log::info!("loading plugin: {}", self.name());
+        if let Some(allowlist) = &static_owner_allowlist {
+            log::info!(
+                "static owner allowlist enabled with {} owners",
+                allowlist.len()
+            );
+        }
 
         // Reset metrics to prevent accumulation across plugin reload cycles
         metrics::reset_metrics();
@@ -107,9 +130,6 @@ impl GeyserPlugin for Plugin {
             .build()
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
 
-        let encoder_threads = config.grpc.encoder_threads;
-        let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
-
         let result = runtime.block_on(async move {
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
             // Create prometheus service First so if it fails the plugin doesn't spawn geyser tasks unnecessarily.
@@ -128,32 +148,25 @@ impl GeyserPlugin for Plugin {
                 is_reload,
                 grpc_cancellation_token,
                 grpc_task_tracker,
-                encoder,
             )
             .await
             .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
             Ok::<_, GeyserPluginError>((snapshot_channel, grpc_channel))
         });
 
-        let (snapshot_channel, grpc_channel) = match result {
-            Ok(val) => val,
-            Err(e) => {
-                log::error!("failed to start plugin services: {e}");
-                plugin_cancellation_token.cancel();
-                // join before returning because encoder already dropped, channel closed
-                let _ = encoder_handle.join();
-                return Err(GeyserPluginError::Custom(format!("{e:?}").into()));
-            }
-        };
+        let (snapshot_channel, grpc_channel) = result.inspect_err(|e| {
+            log::error!("failed to start plugin services: {e}");
+            plugin_cancellation_token.cancel();
+        })?;
 
         self.inner = Some(PluginInner {
             runtime,
             snapshot_channel: Mutex::new(snapshot_channel),
             snapshot_channel_closed: AtomicBool::new(false),
             grpc_channel,
+            static_owner_allowlist,
             plugin_cancellation_token,
             plugin_task_tracker,
-            encoder_handle,
         });
 
         Ok(())
@@ -174,10 +187,6 @@ impl GeyserPlugin for Plugin {
             );
             inner.runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
             log::info!("tokio runtime shut down in {:?}", now.elapsed());
-            if let Err(e) = inner.encoder_handle.join() {
-                log::error!("encoder thread panicked: {:?}", e);
-            }
-            log::info!("plugin shutdown complete");
         }
     }
 
@@ -197,6 +206,9 @@ impl GeyserPlugin for Plugin {
                 }
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
+            if !inner.is_account_owner_allowed(account.owner) {
+                return Ok(());
+            }
 
             if is_startup {
                 if let Some(channel) = inner.snapshot_channel.lock().unwrap().as_ref() {
