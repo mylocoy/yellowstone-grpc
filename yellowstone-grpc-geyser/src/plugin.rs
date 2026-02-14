@@ -41,6 +41,8 @@ pub struct PluginInner {
     shm_sequence: AtomicU64,
     /// Consecutive SHM write error count. Reset to 0 on success.
     shm_consecutive_errors: AtomicU64,
+    /// Unix timestamp in nanos; SHM writes are skipped while now < retry_after.
+    shm_retry_after_unix_nanos: AtomicU64,
     shm_disable_grpc_accounts: bool,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
@@ -62,8 +64,10 @@ impl PluginInner {
         }
     }
 
-    /// Maximum consecutive SHM write errors before disabling writes for good.
+    /// Maximum consecutive SHM write errors before pausing writes temporarily.
     const SHM_MAX_CONSECUTIVE_ERRORS: u64 = 64;
+    /// Backoff duration after reaching `SHM_MAX_CONSECUTIVE_ERRORS`.
+    const SHM_ERROR_BACKOFF: Duration = Duration::from_secs(5);
 
     fn write_account_to_shm(
         &self,
@@ -74,8 +78,25 @@ impl PluginInner {
         let Some(shm_writer) = &self.shm_writer else {
             return;
         };
-        // Skip if too many consecutive errors have accumulated.
-        if self.shm_consecutive_errors.load(Ordering::Relaxed) >= Self::SHM_MAX_CONSECUTIVE_ERRORS {
+
+        let retry_after = self.shm_retry_after_unix_nanos.load(Ordering::Relaxed);
+        if retry_after != 0 {
+            let now_unix_nanos = Self::unix_now_nanos();
+            if now_unix_nanos < retry_after {
+                return;
+            }
+            if self
+                .shm_retry_after_unix_nanos
+                .compare_exchange(retry_after, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                log::warn!("shm write backoff elapsed, attempting writes again");
+            }
+        }
+
+        if self.shm_consecutive_errors.load(Ordering::Relaxed) >= Self::SHM_MAX_CONSECUTIVE_ERRORS
+            && self.shm_retry_after_unix_nanos.load(Ordering::Relaxed) != 0
+        {
             return;
         }
 
@@ -119,6 +140,7 @@ impl PluginInner {
             Ok(()) => {
                 // Reset error counter on success.
                 self.shm_consecutive_errors.store(0, Ordering::Relaxed);
+                self.shm_retry_after_unix_nanos.store(0, Ordering::Relaxed);
             }
             Err(error) => {
                 self.record_shm_error(&format!("shm write failed: {error:?}"));
@@ -127,17 +149,32 @@ impl PluginInner {
     }
 
     fn record_shm_error(&self, message: &str) {
-        let prev = self.shm_consecutive_errors.fetch_add(1, Ordering::Relaxed);
-        if prev == 0 {
+        let consecutive_errors = self.shm_consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if consecutive_errors == 1 {
             // Log only the first error in a streak to avoid log spam.
             log::error!("{message}");
         }
-        if prev + 1 == Self::SHM_MAX_CONSECUTIVE_ERRORS {
-            log::error!(
-                "shm write disabled after {} consecutive errors",
-                Self::SHM_MAX_CONSECUTIVE_ERRORS
-            );
+        if consecutive_errors >= Self::SHM_MAX_CONSECUTIVE_ERRORS {
+            let now_unix_nanos = Self::unix_now_nanos();
+            let backoff_nanos = Self::SHM_ERROR_BACKOFF.as_nanos().min(u64::MAX as u128) as u64;
+            let retry_after = now_unix_nanos.saturating_add(backoff_nanos);
+            self.shm_retry_after_unix_nanos
+                .store(retry_after, Ordering::Relaxed);
+            if consecutive_errors == Self::SHM_MAX_CONSECUTIVE_ERRORS {
+                log::error!(
+                    "shm write paused after {} consecutive errors, retrying after {:?}",
+                    Self::SHM_MAX_CONSECUTIVE_ERRORS,
+                    Self::SHM_ERROR_BACKOFF
+                );
+            }
         }
+    }
+
+    fn unix_now_nanos() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0)
     }
 }
 
@@ -300,6 +337,7 @@ impl GeyserPlugin for Plugin {
             shm_writer,
             shm_sequence: AtomicU64::new(0),
             shm_consecutive_errors: AtomicU64::new(0),
+            shm_retry_after_unix_nanos: AtomicU64::new(0),
             shm_disable_grpc_accounts,
             plugin_cancellation_token,
             plugin_task_tracker,

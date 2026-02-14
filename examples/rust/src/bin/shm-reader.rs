@@ -51,22 +51,26 @@ struct Args {
     /// Disable per-account dedup by (slot, write_version)
     #[clap(long, default_value_t = false)]
     disable_dedup: bool,
+
+    /// Maximum number of pubkeys tracked in dedup map.
+    #[clap(long, default_value_t = DEDUP_DEFAULT_MAX_ENTRIES)]
+    dedup_max_entries: usize,
 }
 
-/// Maximum number of pubkeys tracked in the dedup map.
-/// When exceeded, the map is cleared to reclaim memory. On Solana mainnet
-/// there are ~300M accounts, so this caps memory at ~40 bytes * 2M ≈ 80 MB.
-const DEDUP_MAX_ENTRIES: usize = 2_000_000;
+const DEDUP_DEFAULT_MAX_ENTRIES: usize = 2_000_000;
+const DEDUP_MIN_MAX_ENTRIES: usize = 1_000;
 
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let args = Args::parse();
+    let dedup_max_entries = args.dedup_max_entries.max(DEDUP_MIN_MAX_ENTRIES);
+    let dedup_retain_capacity = (dedup_max_entries / 8).max(DEDUP_MIN_MAX_ENTRIES);
     let shm_path = resolve_shm_path(&args)?;
     let mut reader = SharedRingReader::open(Path::new(&shm_path), !args.from_start)?;
     info!(
-        "reader started: path={} from_start={} dedup={}",
-        shm_path, args.from_start, !args.disable_dedup
+        "reader started: path={} from_start={} dedup={} dedup_max_entries={}",
+        shm_path, args.from_start, !args.disable_dedup, dedup_max_entries
     );
 
     let poll_interval = Duration::from_micros(args.poll_interval_us.max(50));
@@ -76,7 +80,9 @@ fn main() -> anyhow::Result<()> {
     let mut interval_data_bytes = 0u64;
     let mut interval_seen = 0u64;
     let mut interval_dedup_dropped = 0u64;
-    let mut dedup_state: HashMap<[u8; 32], (u64, u64)> = HashMap::new();
+    let mut interval_dedup_resets = 0u64;
+    let mut dedup_state: HashMap<[u8; 32], (u64, u64)> =
+        HashMap::with_capacity(dedup_retain_capacity);
 
     loop {
         match reader.next_account_frame()? {
@@ -96,12 +102,13 @@ fn main() -> anyhow::Result<()> {
                         continue;
                     }
                     dedup_state.insert(frame.pubkey, (frame.slot, frame.write_version));
-                    if dedup_state.len() > DEDUP_MAX_ENTRIES {
+                    if dedup_state.len() > dedup_max_entries {
+                        interval_dedup_resets += 1;
                         info!(
-                            "dedup map exceeded {} entries, clearing",
-                            DEDUP_MAX_ENTRIES
+                            "dedup map exceeded {} entries, rebuilding (retain_capacity={})",
+                            dedup_max_entries, dedup_retain_capacity
                         );
-                        dedup_state.clear();
+                        dedup_state = HashMap::with_capacity(dedup_retain_capacity);
                     }
                 }
 
@@ -139,10 +146,11 @@ fn main() -> anyhow::Result<()> {
         if last_report.elapsed() >= stats_interval {
             let stats = reader.stats();
             info!(
-                "reader stats: seen={} delivered={} dedup_dropped={} tracked_accounts={} data_bytes={} skipped_local={} dropped_global={} write_pos={} tail_pos={} total_written={}",
+                "reader stats: seen={} delivered={} dedup_dropped={} dedup_resets={} tracked_accounts={} data_bytes={} skipped_local={} dropped_global={} write_pos={} tail_pos={} total_written={}",
                 interval_seen,
                 interval_messages,
                 interval_dedup_dropped,
+                interval_dedup_resets,
                 dedup_state.len(),
                 interval_data_bytes,
                 stats.skipped_records,
@@ -154,6 +162,7 @@ fn main() -> anyhow::Result<()> {
             interval_seen = 0;
             interval_messages = 0;
             interval_dedup_dropped = 0;
+            interval_dedup_resets = 0;
             interval_data_bytes = 0;
             last_report = Instant::now();
         }

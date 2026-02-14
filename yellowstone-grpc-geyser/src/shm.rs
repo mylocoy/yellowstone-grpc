@@ -21,7 +21,8 @@ use {
 // ───────────────────────────────────────────────────────────────────────────
 const HEADER_BYTES: usize = 4096;
 const HEADER_MAGIC: [u8; 8] = *b"YGRING01";
-const HEADER_VERSION: u32 = 1;
+const HEADER_VERSION_LEGACY: u32 = 1;
+const HEADER_VERSION: u32 = 2;
 
 const OFFSET_MAGIC: usize = 0;
 const OFFSET_VERSION: usize = 8;
@@ -43,6 +44,12 @@ const _: () = assert!(ACCOUNT_FRAME_FIXED_BYTES == 184);
 const FLAG_IS_STARTUP: u16 = 1 << 0;
 const FLAG_EXECUTABLE: u16 = 1 << 1;
 const FLAG_HAS_TXN_SIGNATURE: u16 = 1 << 2;
+
+#[derive(Debug, Clone, Copy)]
+struct RingHeaderMeta {
+    version: u32,
+    capacity: usize,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct AccountFrameInput<'a> {
@@ -138,12 +145,22 @@ impl PosixShmRingWriter {
         if should_reset {
             this.initialize_header();
         } else {
-            let mapped_capacity = verify_header(this.mmap_slice())?;
-            if mapped_capacity != capacity {
+            let header = verify_header(this.mmap_slice())?;
+            if header.capacity != capacity {
                 bail!(
-                    "ring capacity mismatch for {}: mapped={mapped_capacity} requested={capacity}",
-                    this.name
+                    "ring capacity mismatch for {}: mapped={} requested={capacity}",
+                    this.name,
+                    header.capacity
                 );
+            }
+            if header.version != HEADER_VERSION {
+                log::warn!(
+                    "ring version mismatch for {}: mapped={} expected={}, reinitializing ring",
+                    this.name,
+                    header.version,
+                    HEADER_VERSION
+                );
+                this.initialize_header();
             }
         }
 
@@ -184,9 +201,9 @@ impl PosixShmRingWriter {
         let capacity_u64 = self.capacity as u64;
         let write_pos = self.load_write_pos();
         let mut tail_pos = self.load_tail_pos();
-        let next_write = write_pos.checked_add(record_len as u64).context(
-            "write_pos overflow: ring buffer absolute offset exhausted",
-        )?;
+        let next_write = write_pos
+            .checked_add(record_len as u64)
+            .context("write_pos overflow: ring buffer absolute offset exhausted")?;
 
         // Guard against corrupted tail_pos (e.g. after crash or external tampering).
         // If tail_pos is ahead of write_pos, reset it to make forward progress.
@@ -347,7 +364,7 @@ fn open_shm(name: &str, mode: u32) -> anyhow::Result<c_int> {
     }
 }
 
-fn verify_header(mmap: &[u8]) -> anyhow::Result<usize> {
+fn verify_header(mmap: &[u8]) -> anyhow::Result<RingHeaderMeta> {
     if mmap.len() < HEADER_BYTES {
         bail!("ring file is smaller than header");
     }
@@ -360,8 +377,10 @@ fn verify_header(mmap: &[u8]) -> anyhow::Result<usize> {
     }
 
     let version = load_u32(mmap, OFFSET_VERSION)?;
-    if version != HEADER_VERSION {
-        bail!("ring version mismatch: {version} != {HEADER_VERSION}");
+    if version != HEADER_VERSION_LEGACY && version != HEADER_VERSION {
+        bail!(
+            "unsupported ring version: {version}, expected {HEADER_VERSION_LEGACY} or {HEADER_VERSION}"
+        );
     }
 
     let header_bytes = load_u32(mmap, OFFSET_HEADER_BYTES)? as usize;
@@ -378,7 +397,7 @@ fn verify_header(mmap: &[u8]) -> anyhow::Result<usize> {
         );
     }
 
-    Ok(capacity)
+    Ok(RingHeaderMeta { version, capacity })
 }
 
 fn encode_account_frame(frame: AccountFrameInput<'_>) -> anyhow::Result<Vec<u8>> {
