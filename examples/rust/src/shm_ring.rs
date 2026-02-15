@@ -18,7 +18,6 @@ pub const DEFAULT_POSIX_SHM_NAME: &str = "/yellowstone_accounts";
 // ───────────────────────────────────────────────────────────────────────────
 const HEADER_BYTES: usize = 4096;
 const HEADER_MAGIC: [u8; 8] = *b"YGRING01";
-const HEADER_VERSION_LEGACY: u32 = 1;
 const HEADER_VERSION: u32 = 2;
 
 const OFFSET_MAGIC: usize = 0;
@@ -70,13 +69,11 @@ pub struct SharedRingReader {
     mmap: Mmap,
     capacity: usize,
     cursor: u64,
-    frame_has_crc32: bool,
     skipped_records: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct RingHeaderMeta {
-    version: u32,
     capacity: usize,
 }
 
@@ -95,9 +92,6 @@ impl SharedRingReader {
 
         let header =
             verify_header(&mmap).with_context(|| format!("invalid ring header in {path:?}"))?;
-        if header.version == HEADER_VERSION_LEGACY {
-            log::warn!("reading legacy ring format v1 without per-frame CRC32 validation");
-        }
         let cursor = if from_latest {
             atomic_u64(mmap.as_ref(), OFFSET_WRITE_POS).load(Ordering::Acquire)
         } else {
@@ -108,7 +102,6 @@ impl SharedRingReader {
             mmap,
             capacity: header.capacity,
             cursor,
-            frame_has_crc32: header.version >= HEADER_VERSION,
             skipped_records: 0,
         })
     }
@@ -159,7 +152,7 @@ impl SharedRingReader {
         let Some(payload) = self.next_payload()? else {
             return Ok(None);
         };
-        decode_account_frame_with_integrity(&payload, self.frame_has_crc32).map(Some)
+        decode_account_frame(&payload).map(Some)
     }
 
     pub fn stats(&self) -> ReaderStats {
@@ -204,50 +197,28 @@ impl SharedRingReader {
 const CRC32_TAIL_BYTES: usize = 4;
 
 pub fn decode_account_frame(payload: &[u8]) -> anyhow::Result<AccountFrame> {
-    let crc_error = match decode_account_frame_with_integrity(payload, true) {
-        Ok(frame) => return Ok(frame),
-        Err(error) => error,
-    };
-    decode_account_frame_with_integrity(payload, false).map_err(|_| crc_error)
-}
-
-fn decode_account_frame_with_integrity(
-    payload: &[u8],
-    expect_crc32: bool,
-) -> anyhow::Result<AccountFrame> {
-    let body = if expect_crc32 {
-        if payload.len() < ACCOUNT_FRAME_FIXED_BYTES + CRC32_TAIL_BYTES {
-            bail!(
-                "invalid account frame: len {} < minimum {}",
-                payload.len(),
-                ACCOUNT_FRAME_FIXED_BYTES + CRC32_TAIL_BYTES
-            );
-        }
-        let (body, crc_bytes) = payload.split_at(payload.len() - CRC32_TAIL_BYTES);
-        let stored_crc = u32::from_le_bytes(
-            crc_bytes
-                .try_into()
-                .context("failed to read CRC32 from payload tail")?,
+    if payload.len() < ACCOUNT_FRAME_FIXED_BYTES + CRC32_TAIL_BYTES {
+        bail!(
+            "invalid account frame: len {} < minimum {}",
+            payload.len(),
+            ACCOUNT_FRAME_FIXED_BYTES + CRC32_TAIL_BYTES
         );
-        let mut hasher = Crc32Hasher::new();
-        hasher.update(body);
-        let computed_crc = hasher.finalize();
-        if stored_crc != computed_crc {
-            bail!(
-                "CRC32 mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x} (payload corrupt or partially written)"
-            );
-        }
-        body
-    } else {
-        if payload.len() < ACCOUNT_FRAME_FIXED_BYTES {
-            bail!(
-                "invalid account frame: len {} < minimum {}",
-                payload.len(),
-                ACCOUNT_FRAME_FIXED_BYTES
-            );
-        }
-        payload
-    };
+    }
+
+    let (body, crc_bytes) = payload.split_at(payload.len() - CRC32_TAIL_BYTES);
+    let stored_crc = u32::from_le_bytes(
+        crc_bytes
+            .try_into()
+            .context("failed to read CRC32 from payload tail")?,
+    );
+    let mut hasher = Crc32Hasher::new();
+    hasher.update(body);
+    let computed_crc = hasher.finalize();
+    if stored_crc != computed_crc {
+        bail!(
+            "CRC32 mismatch: stored={stored_crc:#010x} computed={computed_crc:#010x} (payload corrupt or partially written)"
+        );
+    }
 
     decode_account_frame_body(body)
 }
@@ -381,10 +352,8 @@ fn verify_header(mmap: &[u8]) -> anyhow::Result<RingHeaderMeta> {
     }
 
     let version = load_u32(mmap, OFFSET_VERSION)?;
-    if version != HEADER_VERSION_LEGACY && version != HEADER_VERSION {
-        bail!(
-            "unsupported ring version: {version}, expected {HEADER_VERSION_LEGACY} or {HEADER_VERSION}"
-        );
+    if version != HEADER_VERSION {
+        bail!("ring version mismatch: {version} != {HEADER_VERSION}");
     }
 
     let header_bytes = load_u32(mmap, OFFSET_HEADER_BYTES)? as usize;
@@ -401,7 +370,7 @@ fn verify_header(mmap: &[u8]) -> anyhow::Result<RingHeaderMeta> {
         );
     }
 
-    Ok(RingHeaderMeta { version, capacity })
+    Ok(RingHeaderMeta { capacity })
 }
 
 fn copy_from_ring(
@@ -515,23 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_v1_frame_decode() {
-        let payload = encode_test_account_frame_v1();
-        let frame = decode_account_frame(&payload).expect("v1 decode should succeed");
-        assert_eq!(frame.sequence, 7);
-        assert_eq!(frame.slot, 42);
-        assert_eq!(frame.write_version, 99);
-        assert_eq!(frame.lamports, 123_456);
-        assert_eq!(frame.pubkey, [1u8; 32]);
-        assert_eq!(frame.owner, [2u8; 32]);
-        assert!(frame.executable);
-        assert!(!frame.is_startup);
-        assert_eq!(frame.txn_signature, Some([3u8; 64]));
-        assert_eq!(frame.data, vec![7, 8, 9]);
-    }
-
-    /// Encode a v1 frame (no CRC32 suffix).
-    fn encode_test_account_frame_v1() -> Vec<u8> {
+    fn test_legacy_v1_frame_rejected() {
         let mut payload = Vec::new();
         let flags = super::FLAG_EXECUTABLE | super::FLAG_HAS_TXN_SIGNATURE;
         payload.extend_from_slice(&ACCOUNT_FRAME_KIND.to_le_bytes());
@@ -547,8 +500,9 @@ mod tests {
         payload.extend_from_slice(&[3u8; 64]);
         payload.extend_from_slice(&(3u32).to_le_bytes());
         payload.extend_from_slice(&[7u8, 8u8, 9u8]);
-        // No CRC32 — v1 legacy format
-        payload
+
+        let result = decode_account_frame(&payload);
+        assert!(result.is_err(), "legacy v1 payload must be rejected");
     }
 
     fn encode_test_account_frame() -> Vec<u8> {

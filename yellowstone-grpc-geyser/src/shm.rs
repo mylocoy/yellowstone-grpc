@@ -21,7 +21,6 @@ use {
 // ───────────────────────────────────────────────────────────────────────────
 const HEADER_BYTES: usize = 4096;
 const HEADER_MAGIC: [u8; 8] = *b"YGRING01";
-const HEADER_VERSION_LEGACY: u32 = 1;
 const HEADER_VERSION: u32 = 2;
 
 const OFFSET_MAGIC: usize = 0;
@@ -47,7 +46,6 @@ const FLAG_HAS_TXN_SIGNATURE: u16 = 1 << 2;
 
 #[derive(Debug, Clone, Copy)]
 struct RingHeaderMeta {
-    version: u32,
     capacity: usize,
 }
 
@@ -152,15 +150,6 @@ impl PosixShmRingWriter {
                     this.name,
                     header.capacity
                 );
-            }
-            if header.version != HEADER_VERSION {
-                log::warn!(
-                    "ring version mismatch for {}: mapped={} expected={}, reinitializing ring",
-                    this.name,
-                    header.version,
-                    HEADER_VERSION
-                );
-                this.initialize_header();
             }
         }
 
@@ -377,10 +366,8 @@ fn verify_header(mmap: &[u8]) -> anyhow::Result<RingHeaderMeta> {
     }
 
     let version = load_u32(mmap, OFFSET_VERSION)?;
-    if version != HEADER_VERSION_LEGACY && version != HEADER_VERSION {
-        bail!(
-            "unsupported ring version: {version}, expected {HEADER_VERSION_LEGACY} or {HEADER_VERSION}"
-        );
+    if version != HEADER_VERSION {
+        bail!("ring version mismatch: {version} != {HEADER_VERSION}");
     }
 
     let header_bytes = load_u32(mmap, OFFSET_HEADER_BYTES)? as usize;
@@ -397,7 +384,7 @@ fn verify_header(mmap: &[u8]) -> anyhow::Result<RingHeaderMeta> {
         );
     }
 
-    Ok(RingHeaderMeta { version, capacity })
+    Ok(RingHeaderMeta { capacity })
 }
 
 fn encode_account_frame(frame: AccountFrameInput<'_>) -> anyhow::Result<Vec<u8>> {
