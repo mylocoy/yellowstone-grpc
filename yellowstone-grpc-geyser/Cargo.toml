@@ -24,6 +24,7 @@ bincode = { workspace = true }
 bs58 = { workspace = true }
 bytes = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+crc32fast = { workspace = true }
 crossbeam-channel = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
@@ -33,6 +34,7 @@ humantime-serde = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 lazy_static = { workspace = true }
+libc = { workspace = true }
 log = { workspace = true }
 prometheus = { workspace = true }
 prost = { workspace = true }
