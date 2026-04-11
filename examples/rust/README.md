@@ -63,6 +63,16 @@ cargo run --bin client -- -e "https://api.rpcpool.com" \
 
 This RPC is only available on Triton extension servers. The open-source `yellowstone-grpc-geyser` server in this repository currently returns `UNIMPLEMENTED` for `SubscribeDeshred`.
 
+### reader: consume plugin POSIX shm (`grpc.shm.name`)
+```shell
+cargo run --bin shm-reader -- \
+  --shm-name "/yellowstone_accounts" \
+  --print-updates
+```
+
+`shm-reader` enables per-account dedup by default (`slot + write_version`).
+Use `--disable-dedup` to see every frame.
+
 ### unary Ping
 ```shell
 cargo run --bin client -- -e "https://api.rpcpool.com" \

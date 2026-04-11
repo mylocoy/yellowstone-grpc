@@ -11,20 +11,22 @@ use {
                 MessageTransaction,
             },
         },
+        shm::{AccountFrameInput, PosixShmRingWriter},
     },
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoVersions, ReplicaBlockInfoVersions,
-        ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions, Result as PluginResult,
-        SlotStatus,
+        GeyserPlugin, GeyserPluginError, ReplicaAccountInfoV3, ReplicaAccountInfoVersions,
+        ReplicaBlockInfoVersions, ReplicaEntryInfoVersions, ReplicaTransactionInfoVersions,
+        Result as PluginResult, SlotStatus,
     },
     solana_pubkey::Pubkey,
     std::{
+        collections::HashSet,
         concat, env,
         sync::{
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             Arc, Mutex,
         },
-        time::Duration,
+        time::{Duration, SystemTime, UNIX_EPOCH},
     },
     tokio::{
         runtime::{Builder, Runtime},
@@ -40,9 +42,16 @@ pub struct PluginInner {
     snapshot_channel_closed: AtomicBool,
     filter_limits: FilterLimits,
     grpc_channel: mpsc::UnboundedSender<Message>,
+    static_owner_allowlist: Option<HashSet<[u8; 32]>>,
+    shm_writer: Option<Mutex<PosixShmRingWriter>>,
+    shm_sequence: AtomicU64,
+    /// Consecutive SHM write error count. Reset to 0 on success.
+    shm_consecutive_errors: AtomicU64,
+    /// Unix timestamp in nanos; SHM writes are skipped while now < retry_after.
+    shm_retry_after_unix_nanos: AtomicU64,
+    shm_disable_grpc_accounts: bool,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
-    encoder_handle: std::thread::JoinHandle<()>,
 }
 
 impl PluginInner {
@@ -50,6 +59,137 @@ impl PluginInner {
         if self.grpc_channel.send(message).is_ok() {
             metrics::message_queue_size_inc();
         }
+    }
+
+    fn is_account_owner_allowed(&self, owner: &[u8]) -> bool {
+        match &self.static_owner_allowlist {
+            Some(allowlist) => <&[u8; 32]>::try_from(owner)
+                .map(|owner| allowlist.contains(owner))
+                .unwrap_or(false),
+            None => true,
+        }
+    }
+
+    /// Maximum consecutive SHM write errors before pausing writes temporarily.
+    const SHM_MAX_CONSECUTIVE_ERRORS: u64 = 64;
+    /// Backoff duration after reaching `SHM_MAX_CONSECUTIVE_ERRORS`.
+    const SHM_ERROR_BACKOFF: Duration = Duration::from_secs(5);
+
+    fn write_account_to_shm(
+        &self,
+        account: &ReplicaAccountInfoV3<'_>,
+        slot: u64,
+        is_startup: bool,
+    ) {
+        let Some(shm_writer) = &self.shm_writer else {
+            return;
+        };
+
+        let retry_after = self.shm_retry_after_unix_nanos.load(Ordering::Relaxed);
+        if retry_after != 0 {
+            let now_unix_nanos = Self::unix_now_nanos();
+            if now_unix_nanos < retry_after {
+                return;
+            }
+            if self
+                .shm_retry_after_unix_nanos
+                .compare_exchange(retry_after, 0, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // Reset error counter here so the second guard below cannot
+                // falsely re-block the retry if record_shm_error races in
+                // from another thread between CAS and the guard check.
+                self.shm_consecutive_errors.store(0, Ordering::Relaxed);
+                log::warn!("shm write backoff elapsed, attempting writes again");
+            }
+        }
+
+        if self.shm_consecutive_errors.load(Ordering::Relaxed) >= Self::SHM_MAX_CONSECUTIVE_ERRORS
+            && self.shm_retry_after_unix_nanos.load(Ordering::Relaxed) != 0
+        {
+            return;
+        }
+
+        let Ok(pubkey) = <[u8; 32]>::try_from(account.pubkey) else {
+            self.record_shm_error("invalid pubkey length in account update");
+            return;
+        };
+        let Ok(owner) = <[u8; 32]>::try_from(account.owner) else {
+            self.record_shm_error("invalid owner length in account update");
+            return;
+        };
+        let txn_signature = account
+            .txn
+            .and_then(|txn| <[u8; 64]>::try_from(txn.signature().as_ref()).ok());
+
+        let created_at_unix_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0);
+        let sequence = self.shm_sequence.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let Ok(mut writer) = shm_writer.lock() else {
+            self.record_shm_error("failed to lock shm writer (poisoned)");
+            return;
+        };
+
+        match writer.push_account_frame(AccountFrameInput {
+            sequence,
+            created_at_unix_nanos,
+            slot,
+            write_version: account.write_version,
+            lamports: account.lamports,
+            rent_epoch: account.rent_epoch,
+            pubkey,
+            owner,
+            executable: account.executable,
+            is_startup,
+            txn_signature,
+            data: account.data,
+        }) {
+            Ok(()) => {
+                // Reset error counter on success.
+                self.shm_consecutive_errors.store(0, Ordering::Relaxed);
+                self.shm_retry_after_unix_nanos.store(0, Ordering::Relaxed);
+            }
+            Err(error) => {
+                self.record_shm_error(&format!("shm write failed: {error:?}"));
+            }
+        }
+    }
+
+    fn record_shm_error(&self, message: &str) {
+        let prev = self.shm_consecutive_errors.load(Ordering::Relaxed);
+        if prev >= Self::SHM_MAX_CONSECUTIVE_ERRORS {
+            // Already at threshold — skip increment to avoid unbounded growth.
+            return;
+        }
+        let consecutive_errors = self.shm_consecutive_errors.fetch_add(1, Ordering::Relaxed) + 1;
+        if consecutive_errors == 1 {
+            // Log only the first error in a streak to avoid log spam.
+            log::error!("{message}");
+        }
+        if consecutive_errors >= Self::SHM_MAX_CONSECUTIVE_ERRORS {
+            let now_unix_nanos = Self::unix_now_nanos();
+            let backoff_nanos = Self::SHM_ERROR_BACKOFF.as_nanos().min(u64::MAX as u128) as u64;
+            let retry_after = now_unix_nanos.saturating_add(backoff_nanos);
+            self.shm_retry_after_unix_nanos
+                .store(retry_after, Ordering::Relaxed);
+            if consecutive_errors == Self::SHM_MAX_CONSECUTIVE_ERRORS {
+                log::error!(
+                    "shm write paused after {} consecutive errors, retrying after {:?}",
+                    Self::SHM_MAX_CONSECUTIVE_ERRORS,
+                    Self::SHM_ERROR_BACKOFF
+                );
+            }
+        }
+    }
+
+    fn unix_now_nanos() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
+            .unwrap_or(0)
     }
 }
 
@@ -83,10 +223,53 @@ impl GeyserPlugin for Plugin {
         let config = Config::load_from_file(config_file)?;
         let filter_limits = config.grpc.filter_limits.clone();
 
-        // Setup logger
         solana_logger::setup_with_default(&config.log.level);
-
         log::info!("loading plugin: {}", self.name());
+
+        let static_owner_allowlist = (!config.grpc.static_owner_allowlist.is_empty()).then(|| {
+            config
+                .grpc
+                .static_owner_allowlist
+                .iter()
+                .map(|owner| owner.to_bytes())
+                .collect::<HashSet<_>>()
+        });
+        let shm_disable_grpc_accounts = config
+            .grpc
+            .shm
+            .as_ref()
+            .map(|shm| shm.disable_grpc_accounts)
+            .unwrap_or(false);
+        let shm_writer = match &config.grpc.shm {
+            Some(shm_config) => {
+                let shm_writer = PosixShmRingWriter::create(shm_config).map_err(|error| {
+                    GeyserPluginError::Custom(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("{error:?}"),
+                    )))
+                })?;
+                log::info!(
+                    "shm output enabled: name={} path={} ring_bytes={} mode={:o} reset_on_start={} disable_grpc_accounts={}",
+                    shm_writer.shm_name(),
+                    shm_writer.shm_path(),
+                    shm_config.ring_bytes,
+                    shm_config.mode,
+                    shm_config.reset_on_start,
+                    shm_config.disable_grpc_accounts
+                );
+                Some(Mutex::new(shm_writer))
+            }
+            None => None,
+        };
+        if let Some(allowlist) = &static_owner_allowlist {
+            log::info!(
+                "static owner allowlist enabled with {} owners",
+                allowlist.len()
+            );
+        }
+        if shm_disable_grpc_accounts {
+            log::warn!("gRPC account forwarding disabled; account updates are available only via shm output");
+        }
 
         // Reset metrics to prevent accumulation across plugin reload cycles
         metrics::reset_metrics();
@@ -107,15 +290,24 @@ impl GeyserPlugin for Plugin {
         let prometheus_task_tracker = plugin_task_tracker.clone();
         let grpc_cancellation_token = plugin_cancellation_token.child_token();
         let grpc_task_tracker = plugin_task_tracker.clone();
+        let parallel_encoder_threads = config
+            .tokio
+            .worker_threads
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|value| value.get())
+                    .unwrap_or(1)
+            })
+            .max(1);
+        let (parallel_encoder, _parallel_encoder_handle) =
+            ParallelEncoder::new(parallel_encoder_threads);
+        log::info!("parallel encoder enabled with {parallel_encoder_threads} threads");
 
         let runtime = builder
             .thread_name_fn(crate::get_thread_name)
             .enable_all()
             .build()
             .map_err(|error| GeyserPluginError::Custom(Box::new(error)))?;
-
-        let encoder_threads = config.grpc.encoder_threads;
-        let (encoder, encoder_handle) = ParallelEncoder::new(encoder_threads);
 
         let result = runtime.block_on(async move {
             let (debug_client_tx, debug_client_rx) = mpsc::unbounded_channel();
@@ -135,23 +327,22 @@ impl GeyserPlugin for Plugin {
                 is_reload,
                 grpc_cancellation_token,
                 grpc_task_tracker,
-                encoder,
+                parallel_encoder,
             )
             .await
-            .map_err(|error| GeyserPluginError::Custom(format!("{error:?}").into()))?;
+            .map_err(|error| {
+                GeyserPluginError::Custom(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("{error:?}"),
+                )))
+            })?;
             Ok::<_, GeyserPluginError>((snapshot_channel, grpc_channel))
         });
 
-        let (snapshot_channel, grpc_channel) = match result {
-            Ok(val) => val,
-            Err(e) => {
-                log::error!("failed to start plugin services: {e}");
-                plugin_cancellation_token.cancel();
-                // join before returning because encoder already dropped, channel closed
-                let _ = encoder_handle.join();
-                return Err(GeyserPluginError::Custom(format!("{e:?}").into()));
-            }
-        };
+        let (snapshot_channel, grpc_channel) = result.inspect_err(|e| {
+            log::error!("failed to start plugin services: {e}");
+            plugin_cancellation_token.cancel();
+        })?;
 
         self.inner = Some(PluginInner {
             runtime,
@@ -159,9 +350,14 @@ impl GeyserPlugin for Plugin {
             snapshot_channel_closed: AtomicBool::new(false),
             filter_limits,
             grpc_channel,
+            static_owner_allowlist,
+            shm_writer,
+            shm_sequence: AtomicU64::new(0),
+            shm_consecutive_errors: AtomicU64::new(0),
+            shm_retry_after_unix_nanos: AtomicU64::new(0),
+            shm_disable_grpc_accounts,
             plugin_cancellation_token,
             plugin_task_tracker,
-            encoder_handle,
         });
 
         Ok(())
@@ -182,10 +378,6 @@ impl GeyserPlugin for Plugin {
             );
             inner.runtime.shutdown_timeout(SHUTDOWN_TIMEOUT);
             log::info!("tokio runtime shut down in {:?}", now.elapsed());
-            if let Err(e) = inner.encoder_handle.join() {
-                log::error!("encoder thread panicked: {:?}", e);
-            }
-            log::info!("plugin shutdown complete");
         }
     }
 
@@ -205,6 +397,13 @@ impl GeyserPlugin for Plugin {
                 }
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
+            if !inner.is_account_owner_allowed(account.owner) {
+                return Ok(());
+            }
+            inner.write_account_to_shm(account, slot, is_startup);
+            if inner.shm_disable_grpc_accounts {
+                return Ok(());
+            }
 
             if let Ok(owner) = Pubkey::try_from(account.owner) {
                 // Drop accounts from owners in the drop list, even during startup.
