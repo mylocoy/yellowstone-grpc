@@ -350,7 +350,7 @@ fn open_shm(name: &str, mode: u32) -> anyhow::Result<c_int> {
         }
         #[cfg(not(target_vendor = "apple"))]
         {
-            shm_open(c_name.as_ptr(), O_CREAT | O_RDWR, mode as mode_t)
+            shm_open(c_name.as_ptr(), O_CREAT | O_RDWR, mode as libc::mode_t)
         }
     };
     if fd < 0 {
