@@ -18,12 +18,14 @@ backoff = { workspace = true, features = ["tokio"] }
 bs58 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
+crc32fast = { workspace = true }
 env_logger = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 indicatif = { workspace = true }
 log = { workspace = true }
 maplit = { workspace = true }
+memmap2 = "0.9.5"
 serde_json = { workspace = true }
 solana-transaction-status = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "fs"] }

@@ -2130,6 +2130,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
 
 [[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "merlin"
 version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5723,12 +5732,14 @@ dependencies = [
  "bs58",
  "chrono",
  "clap",
+ "crc32fast",
  "env_logger",
  "futures",
  "hex",
  "indicatif",
  "log",
  "maplit",
+ "memmap2",
  "serde_json",
  "solana-hash",
  "solana-pubkey 4.2.0",
@@ -5763,6 +5774,7 @@ dependencies = [
  "bytesize 2.4.0",
  "cargo-lock",
  "clap",
+ "crc32fast",
  "criterion",
  "crossbeam-channel",
  "foldhash 0.2.0",
@@ -5775,6 +5787,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "lazy_static",
+ "libc",
  "log",
  "pin-project",
  "prometheus",
