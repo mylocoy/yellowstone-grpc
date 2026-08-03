@@ -1,5 +1,5 @@
 use {
-    crate::plugin::filter::limits::FilterLimits,
+    crate::{billing::REPORT_INTERVAL, plugin::filter::limits::FilterLimits},
     agave_geyser_plugin_interface::geyser_plugin_interface::{
         GeyserPluginError, Result as PluginResult,
     },
@@ -11,13 +11,18 @@ use {
         fmt,
         fs::read_to_string,
         net::SocketAddr,
+        num::NonZeroUsize,
         path::{Path, PathBuf},
         str::FromStr,
         time::Duration,
     },
     tokio::sync::Semaphore,
     tonic::codec::CompressionEncoding,
+    url::Url,
 };
+
+pub const DEFAULT_TRITON_AUTH_MAX_CONCURRENT_REQUESTS: NonZeroUsize =
+    NonZeroUsize::new(1000).unwrap();
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,6 +37,7 @@ pub struct Config {
     pub prometheus: Option<ConfigPrometheus>,
     /// Collect client filters, processed slot and make it available on prometheus port `/debug_clients`
     #[serde(default)]
+    #[deprecated(note = "This option is deprecated and will be removed in future versions.")]
     pub debug_clients_http: bool,
 }
 
@@ -313,7 +319,7 @@ pub struct ConfigGrpc {
         default = "ConfigGrpc::subscription_limit_default",
         deserialize_with = "deserialize_int_str"
     )]
-    pub subscription_limit: usize,
+    pub subscription_limit: NonZeroUsize,
     /// When false (default), exceeding the subscription limit only logs
     /// and emits metrics without rejecting the connection. Set to true
     /// to start rejecting with RESOURCE_EX2AUSTED.
@@ -398,9 +404,181 @@ pub struct ConfigGrpc {
 #[serde(untagged)]
 pub enum GrpcTlsConfig {
     /// A pair of private-key and cert file paths
-    IdentityPair { identity: TlsIdentityPair },
+    IdentityPair {
+        identity: TlsIdentityPair,
+        #[serde(default)]
+        watch_file: bool,
+    },
     /// HAPROXY-like cert directory with `*.pem` files containing the certs and private keys.
-    CertDir { cert_dir: PathBuf },
+    CertDir {
+        cert_dir: PathBuf,
+        #[serde(default)]
+        watch_file: bool,
+    },
+}
+
+///
+/// Configuration for HTTP-backed authentication for subscription requests.
+///
+/// Query a remote HTTP service to validate incoming subscription requests and retrieve associated metadata.
+///
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpBackedAuthConfig {
+    ///
+    /// The URL of the subscription resolver service.
+    /// The gRPC server will call this service to validate incoming subscription requests and retrieve associated metadata.
+    ///
+    pub subscription_resolver_url: Url,
+
+    ///
+    /// The TTL for caching subscription resolution results.
+    ///
+    /// By defaults, there is no caching and the gRPC server will call the subscription resolver for every incoming subscription request. Setting a TTL enables caching of resolver results, which can help reduce latency and load on the resolver service for frequently seen tokens and hosts.
+    #[serde(default, with = "humantime_serde")]
+    pub subscription_resolution_cache_ttl: Option<Duration>,
+
+    ///
+    /// The maximum number of concurrent authentication requests allowed to the subscription resolver service.
+    /// By default, it is set to 1000,
+    #[serde(
+        default = "HttpBackedAuthConfig::default_max_concurrent_auth_requests",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub max_concurrent_auth_requests: NonZeroUsize,
+
+    #[serde(default = "HttpBackedAuthConfig::default_forwarded_headers")]
+    pub forwarded_headers: Vec<String>,
+
+    #[serde(default)]
+    pub ratelimit: Option<RatelimitConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RatelimitConfig {
+    ///
+    /// The maximum number of hits allowed within the specified time window.
+    /// A negative value indicates that there is no limit, and all requests will be allowed.
+    ///
+    #[serde(
+        default = "RatelimitConfig::default_max_hits",
+        deserialize_with = "deserialize_int_str"
+    )]
+    pub default_max_hits: i32,
+
+    ///
+    /// Window duration for the rate limit. The number of hits is counted within this time window.
+    ///
+    /// On the server, this is a rolling window using token buckets.
+    ///
+    /// # Rolling window details
+    ///
+    ///
+    /// Suppose you allow 1000 request within a 10 seconds rolling window,
+    /// every second we refill 100 tokens to the bucket.
+    ///
+    /// If a client sends 1000 requests before the first second, the bucket will be empty and the next request will be rejected.
+    /// It must wait for the next second to get 100 tokens refilled, and then it can send 100 requests before the next second, and so on.
+    #[serde(default = "RatelimitConfig::default_window", with = "humantime_serde")]
+    pub window: Duration,
+}
+
+impl Default for RatelimitConfig {
+    fn default() -> Self {
+        Self {
+            default_max_hits: RatelimitConfig::default_max_hits(),
+            window: RatelimitConfig::default_window(),
+        }
+    }
+}
+
+impl RatelimitConfig {
+    pub const fn default_max_hits() -> i32 {
+        1000
+    }
+
+    pub const fn default_window() -> Duration {
+        Duration::from_secs(10)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FileBackedAuthConfig {
+    pub subscription_resolver_path: PathBuf,
+
+    #[serde(default)]
+    pub ratelimit: Option<RatelimitConfig>,
+}
+
+impl HttpBackedAuthConfig {
+    pub fn default_forwarded_headers() -> Vec<String> {
+        vec!["x-token".to_string()]
+    }
+
+    pub const fn default_max_concurrent_auth_requests() -> NonZeroUsize {
+        DEFAULT_TRITON_AUTH_MAX_CONCURRENT_REQUESTS
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TrustedMetadataAuthConfig {
+    // Reserved for trusted-metadata-specific options.
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuthConfig {
+    #[serde(flatten)]
+    pub kind: AuthKind,
+    #[serde(default = "AuthConfig::default_ratelimit")]
+    pub ratelimit: Option<RatelimitConfig>,
+    #[serde(default)]
+    pub billing: Option<BillingConfig>,
+}
+
+///
+/// Configuration for billing events. This is used to configure the billing system for the gRPC server.
+///
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum BillingConfig {
+    /// Billing events are sent to a remote HTTP service.
+    Http(HttpBackedBillingConfig),
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HttpBackedBillingConfig {
+    ///
+    /// The URL of the billing endpoint. The gRPC server will send billing events to this endpoint.
+    pub billing_endpoint_url: Url,
+    ///
+    /// The interval at which the gRPC server will report billing events to the billing endpoint.
+    #[serde(
+        default = "HttpBackedBillingConfig::default_report_interval",
+        with = "humantime_serde"
+    )]
+    pub report_interval: Duration,
+}
+
+impl HttpBackedBillingConfig {
+    pub const fn default_report_interval() -> Duration {
+        REPORT_INTERVAL
+    }
+}
+
+impl AuthConfig {
+    pub fn default_ratelimit() -> Option<RatelimitConfig> {
+        Some(RatelimitConfig::default())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum AuthKind {
+    Http(HttpBackedAuthConfig),
+    File(FileBackedAuthConfig),
+    ///
+    /// Trusts the `x-subscription-id` header and does not perform any authentication or authorization checks and apply default rate limits.
+    #[serde(rename = "trusted-metadata")]
+    TrustedMetadata(TrustedMetadataAuthConfig),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -408,6 +586,7 @@ pub enum GrpcTlsConfig {
 pub struct ListenConfig {
     pub address: GrpcAddress,
     pub tls: Option<GrpcTlsConfig>,
+    pub auth: Option<AuthConfig>,
 }
 
 impl ConfigGrpc {
@@ -435,8 +614,8 @@ impl ConfigGrpc {
         Semaphore::MAX_PERMITS
     }
 
-    const fn subscription_limit_default() -> usize {
-        1000
+    const fn subscription_limit_default() -> NonZeroUsize {
+        NonZeroUsize::new(1000).unwrap()
     }
 
     const fn default_filter_name_size_limit() -> usize {

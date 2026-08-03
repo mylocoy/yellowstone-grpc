@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-grpc-geyser"
-version = "14.0.0+solana.4.1.0"
+version = "14.2.2+solana.4.1.0"
 authors = { workspace = true }
 edition = { workspace = true }
 description = "Yellowstone gRPC Geyser Plugin"
@@ -21,8 +21,8 @@ default = []
 bench = ["dep:solana-storage-proto"]
 
 [dependencies]
-tikv-jemallocator = { version = "0.6.1", features = ["disable_initial_exec_tls"] }
 foldhash = { workspace = true }
+arc-swap = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 bs58 = { workspace = true }
@@ -31,6 +31,7 @@ bytesize = { workspace = true, features = ["serde"]}
 clap = { workspace = true, features = ["derive"] }
 crc32fast = { workspace = true }
 crossbeam-channel = { workspace = true }
+dashmap = { workspace = true }
 futures = { workspace = true }
 hostname = { workspace = true }
 http = { workspace = true }
@@ -41,23 +42,28 @@ hyper-util = { workspace = true }
 lazy_static = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
+moka = { workspace = true, features = ["future"] }
 pin-project = { workspace = true }
 prometheus = { workspace = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rayon = { workspace = true }
-serde = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive", "rc"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs", "signal"] }
 tokio-util = { workspace = true, features = ["rt"]}
 tokio-rustls = { workspace = true, features = ["aws-lc-rs"] }
 tokio-stream = { workspace = true }
+tower = { workspace = true }
 tower-layer = { workspace = true }
 tonic = { workspace = true, features = ["gzip", "zstd", "tls-native-roots"] }
 tonic-health = { workspace = true }
 tonic-prost = { workspace = true }
 wincode = { workspace = true }
+url = { workspace = true, features = ["serde"] }
+notify = { workspace = true }
 
 # Agave Monorepo
 agave-geyser-plugin-interface = { workspace = true }

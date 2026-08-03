@@ -22,6 +22,300 @@ solana-validator --geyser-plugin-config yellowstone-grpc-geyser/config.json
 cargo-fmt && cargo run --bin config-check -- --config yellowstone-grpc-geyser/config.json
 ```
 
+### gRPC listen, TLS, and auth configuration
+
+The recommended way to configure gRPC listeners is `grpc.listen`.
+
+`grpc.listen` is an array where each item can define:
+
+- `address`: required
+- `tls`: optional, per-listener TLS config
+- `auth`: optional, per-listener authentication mode
+
+#### Listen address formats
+
+`address` accepts:
+
+- TCP socket as string, for example: `"0.0.0.0:10000"`
+- Unix domain socket as string, for example: `"unix:///var/run/geyser.sock"`
+- Unix domain socket object with explicit permissions mode:
+
+```json
+{
+   "address": {
+      "path": "unix:///var/run/geyser.sock",
+      "mode": 432
+   }
+}
+```
+
+`mode` is decimal (example above is `0o660`).
+
+#### TLS options (`listen[].tls`)
+
+You can configure TLS in two ways:
+
+1. Identity pair (`cert_path` + `key_path`)
+2. Certificate directory (`cert_dir`) with PEM files
+
+```json
+{
+   "tls": {
+      "identity": {
+         "cert_path": "/etc/yellowstone/tls/server.crt",
+         "key_path": "/etc/yellowstone/tls/server.key"
+      }
+   }
+}
+```
+
+```json
+{
+   "tls": {
+      "cert_dir": "/etc/yellowstone/certs"
+   }
+}
+```
+
+Both forms accept an optional `watch_file` flag (default `false`). When `true`, the server watches the relevant path(s) on disk and hot-swaps the served certificate in place, without dropping existing connections or requiring a restart:
+
+- Identity pair: watches `cert_path` and `key_path` individually and rebuilds the identity when either changes.
+- Certificate directory: watches `cert_dir` recursively and rebuilds the SNI resolver when any file under it changes.
+
+```json
+{
+   "tls": {
+      "cert_dir": "/etc/yellowstone/certs",
+      "watch_file": true
+   }
+}
+```
+
+Notes:
+
+- TLS is ignored for Unix domain sockets.
+- ALPN is configured for HTTP/2 automatically.
+
+#### Auth options (`listen[].auth`)
+
+Auth is configured per listener with `type`.
+
+`type: "http"`
+
+- Validates requests using an external HTTP resolver.
+- Expected request query params to resolver: `host` and `token`.
+- Resolver success payload should include `subscription_id` and rate limits (`rate_limits` or `ratelimits`).
+
+HTTP resolver contract:
+
+- Method: `GET`
+- URL: `<subscription_resolver_url>?host=<request-host>&token=<x-token>`
+- Required query params:
+   - `host`: host extracted from the incoming gRPC request URI
+   - `token`: value from the incoming `x-token` header
+- Expected status codes:
+   - `200 OK`: valid `(host, token)` pair, returns subscription info JSON
+   - `404 Not Found`: invalid `(host, token)` pair
+
+The `404` behavior is important: the gRPC server treats it as an unauthenticated request for that host/token pair.
+
+Example request:
+
+```text
+GET http://127.0.0.1:8080/?host=api.example.com
+```
+
+Example `200 OK` response body:
+
+```json
+{
+    "subscription_id": "test-sub",
+    "ratelimits": {
+         "methods": {
+            "/geyser.Geyser/Subscribe": 2000,
+            "/geyser.Geyser/SubscribeReplayInfo": 2000,
+            "/geyser.Geyser/Ping": 2000,
+            "/geyser.Geyser/GetLatestBlockhash": 2000,
+            "/geyser.Geyser/GetBlockHeight": 2000,
+            "/geyser.Geyser/GetSlot": 2000,
+            "/geyser.Geyser/IsBlockhashValid": 2000,
+            "/geyser.Geyser/GetVersion": 2000
+         }
+    }
+}
+```
+
+```json
+{
+   "auth": {
+      "type": "http",
+      "subscription_resolver_url": "http://127.0.0.1:8080/",
+      "subscription_resolution_cache_ttl": "30s",
+      "max_concurrent_auth_requests": 1000
+   }
+}
+```
+
+`type: "file"`
+
+- Validates requests from a local JSON mapping file.
+- The file should contain an array of objects with `token`, `host`, and `subscription_info`.
+
+```json
+{
+   "auth": {
+      "type": "file",
+      "subscription_resolver_path": "/etc/yellowstone/subscriptions.json"
+   }
+}
+```
+
+Example `/etc/yellowstone/subscriptions.json`:
+
+```json
+[
+   {
+      "token": "test",
+      "host": "127.0.0.1",
+      "subscription_info": {
+         "subscription_id": "test-sub",
+         "ratelimits": {
+            "methods": {
+               "/geyser.Geyser/Subscribe": 2000,
+               "/geyser.Geyser/SubscribeReplayInfo": 2000,
+               "/geyser.Geyser/Ping": 2000,
+               "/geyser.Geyser/GetLatestBlockhash": 2000,
+               "/geyser.Geyser/GetBlockHeight": 2000,
+               "/geyser.Geyser/GetSlot": 2000,
+               "/geyser.Geyser/IsBlockhashValid": 2000,
+               "/geyser.Geyser/GetVersion": 2000
+            }
+         }
+      }
+   },
+   {
+      "token": "prod-token-1",
+      "host": "api.example.com",
+      "subscription_info": {
+         "subscription_id": "prod-sub-1",
+         "ratelimits": {
+            "methods": {
+               "/geyser.Geyser/Subscribe": 2000,
+               "/geyser.Geyser/SubscribeReplayInfo": 2000,
+               "/geyser.Geyser/Ping": 2000,
+               "/geyser.Geyser/GetLatestBlockhash": 2000,
+               "/geyser.Geyser/GetBlockHeight": 2000,
+               "/geyser.Geyser/GetSlot": 2000,
+               "/geyser.Geyser/IsBlockhashValid": 2000,
+               "/geyser.Geyser/GetVersion": 2000
+            }
+         }
+      }
+   }
+]
+```
+
+**NOTE**: method rate-limit is not yet implemented.
+
+`type: "trusted-metadata"`
+
+- Trusts the incoming `x-subscription-id` header and skips external auth checks.
+
+```json
+{
+   "auth": {
+      "type": "trusted-metadata"
+   }
+}
+```
+
+#### Billing monitoring (`listen[].auth.billing`)
+
+Billing monitoring is configured under `listen[].auth.billing`.
+
+Currently supported mode:
+
+- `type: "http"`
+
+```json
+{
+   "auth": {
+      "type": "http",
+      "subscription_resolver_url": "http://127.0.0.1:8080/",
+      "billing": {
+         "type": "http",
+         "billing_endpoint_url": "http://127.0.0.1:8081/billing",
+         "report_interval": "5s"
+      }
+   }
+}
+```
+
+Notes:
+
+- Billing monitoring is optional.
+- `report_interval` defaults to `5s` if omitted.
+- Billing events are sent as NDJSON (`application/x-ndjson` style payload): one JSON event per line.
+- Event `code` is one of:
+  - `bandwidth`: metered bytes per request path and subscription
+  - `requests`: method call counts per request path and subscription
+
+Example NDJSON payload:
+
+```ndjson
+{"code":"bandwidth","subscription_id":"sub-1","method":"/geyser.Geyser/Subscribe","quantity":8192}
+{"code":"requests","subscription_id":"sub-1","method":"/geyser.Geyser/Subscribe","quantity":1}
+```
+
+#### Full `listen` example
+
+```json
+{
+   "grpc": {
+      "listen": [
+         {
+            "address": "0.0.0.0:10000",
+            "auth": {
+               "type": "http",
+               "subscription_resolver_url": "http://127.0.0.1:8080/",
+               "subscription_resolution_cache_ttl": "30s",
+               "max_concurrent_auth_requests": 1000
+            }
+         },
+         {
+            "address": "0.0.0.0:10001",
+            "tls": {
+               "identity": {
+                  "cert_path": "/etc/yellowstone/tls/server.crt",
+                  "key_path": "/etc/yellowstone/tls/server.key"
+               },
+               "watch_file": true
+            },
+            "auth": {
+               "type": "trusted-metadata"
+            }
+         },
+         {
+            "address": {
+               "path": "unix:///var/run/geyser.sock",
+               "mode": 432
+            },
+            "auth": {
+               "type": "file",
+               "subscription_resolver_path": "/etc/yellowstone/subscriptions.json"
+            }
+         }
+      ]
+   }
+}
+```
+
+#### Legacy fields
+
+`grpc.address`, `grpc.tls_config`, and `grpc.cert_dir` are legacy and deprecated in favor of `grpc.listen`.
+
+Use `grpc.listen` for new configurations, especially if you need different TLS/auth behavior per endpoint.
+
 ### Pre-commit hooks
 
 Install repository hooks:
