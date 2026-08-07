@@ -5,6 +5,7 @@ use {
     },
     bytesize::ByteSize,
     serde::{de, Deserialize, Deserializer},
+    solana_pubkey::Pubkey,
     std::{
         collections::HashSet,
         fmt,
@@ -341,6 +342,11 @@ pub struct ConfigGrpc {
     pub filter_limits: FilterLimits,
     /// x_token to enforce on connections
     pub x_token: Option<String>,
+    /// Optional static allowlist for account owners.
+    /// If configured with one or more values, only accounts with matching owner
+    /// are forwarded into the gRPC processing pipeline.
+    #[serde(default, deserialize_with = "deserialize_pubkeys")]
+    pub static_owner_allowlist: HashSet<Pubkey>,
     /// Filter name size limit
     #[serde(default = "ConfigGrpc::default_filter_name_size_limit")]
     pub filter_name_size_limit: usize,
@@ -736,6 +742,19 @@ where
     }
 }
 
+fn deserialize_pubkeys<'de, D>(deserializer: D) -> Result<HashSet<Pubkey>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Vec<String>>::deserialize(deserializer)? {
+        Some(values) => values
+            .into_iter()
+            .map(|value| Pubkey::from_str(&value).map_err(de::Error::custom))
+            .collect(),
+        None => Ok(HashSet::new()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -767,6 +786,30 @@ mod tests {
         let config: super::ConfigTokio = serde_json::from_str(json_with_null_affinity).unwrap();
         assert_eq!(config.worker_threads, Some(4));
         assert_eq!(config.affinity, None);
+    }
+
+    #[test]
+    fn test_deser_pubkeys() {
+        use {solana_pubkey::Pubkey, std::collections::HashSet};
+
+        #[derive(serde::Deserialize)]
+        struct Config {
+            #[serde(default, deserialize_with = "super::deserialize_pubkeys")]
+            pubkeys: HashSet<Pubkey>,
+        }
+
+        let json = r#"{
+            "pubkeys": [
+                "11111111111111111111111111111111",
+                "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+            ]
+        }"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.pubkeys.len(), 2);
+
+        let json = r#"{}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.pubkeys.is_empty());
     }
 
     #[test]

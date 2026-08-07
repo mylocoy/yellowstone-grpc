@@ -355,6 +355,8 @@ Accounts can be filtered by:
 
 If all fields are empty, then all accounts are broadcast. Otherwise, fields work as logical `AND` and values in arrays as logical `OR` (except values in `filters` that works as logical `AND`).
 
+If you only need a fixed set of owners, you can pre-filter account updates in plugin config with `grpc.static_owner_allowlist`. This is applied before messages enter the gRPC pipeline and helps reduce CPU and queue pressure.
+
 #### Transactions
 
 - `vote` — enable/disable broadcast `vote` transactions
@@ -412,6 +414,9 @@ It's possible to add limits for filters in the config. If the `filters` field is
 
 ```json
 "grpc": {
+   "static_owner_allowlist": [
+      "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+   ],
    "filters": {
       "accounts": {
          "max": 1,

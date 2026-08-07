@@ -20,6 +20,7 @@ use {
     },
     solana_pubkey::Pubkey,
     std::{
+        collections::HashSet,
         concat, env,
         sync::{
             atomic::{AtomicBool, Ordering},
@@ -46,6 +47,7 @@ pub struct PluginInner {
     block_reconstruction_channel: mpsc::UnboundedSender<BlockReconstructionMessage>, // block_reconstruction_loop
     broadcast_channel: SubscriberChannels,                                           // client_loop
     blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
+    static_owner_allowlist: Option<HashSet<[u8; 32]>>,
     plugin_cancellation_token: CancellationToken,
     plugin_task_tracker: TaskTracker,
     file_watcher: Arc<FileWatcher>,
@@ -84,6 +86,15 @@ impl PluginInner {
             let _ = blocks_meta_tx.send(message);
         }
     }
+
+    fn is_account_owner_allowed(&self, owner: &[u8]) -> bool {
+        match &self.static_owner_allowlist {
+            Some(allowlist) => <&[u8; 32]>::try_from(owner)
+                .map(|owner| allowlist.contains(owner))
+                .unwrap_or(false),
+            None => true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -115,11 +126,25 @@ impl GeyserPlugin for Plugin {
     fn on_load(&mut self, config_file: &str, is_reload: bool) -> PluginResult<()> {
         let config = Config::load_from_file(config_file)?;
         let filter_limits = config.grpc.filter_limits.clone();
+        let static_owner_allowlist = (!config.grpc.static_owner_allowlist.is_empty()).then(|| {
+            config
+                .grpc
+                .static_owner_allowlist
+                .iter()
+                .map(|owner| owner.to_bytes())
+                .collect::<HashSet<_>>()
+        });
 
         // Setup logger
         solana_logger::setup_with_default(&config.log.level);
 
         log::info!("loading plugin: {}", self.name());
+        if let Some(allowlist) = &static_owner_allowlist {
+            log::info!(
+                "static owner allowlist enabled with {} owners",
+                allowlist.len()
+            );
+        }
 
         // Reset metrics to prevent accumulation across plugin reload cycles
         metrics::reset_metrics();
@@ -203,6 +228,7 @@ impl GeyserPlugin for Plugin {
             block_reconstruction_channel: grpc_service_result.block_reconstruction_tx,
             broadcast_channel: grpc_service_result.broadcast,
             blocks_meta_tx: grpc_service_result.blocks_meta_tx,
+            static_owner_allowlist,
             plugin_cancellation_token,
             plugin_task_tracker,
             file_watcher,
@@ -247,6 +273,10 @@ impl GeyserPlugin for Plugin {
                 }
                 ReplicaAccountInfoVersions::V0_0_3(info) => info,
             };
+
+            if !inner.is_account_owner_allowed(account.owner) {
+                return Ok(());
+            }
 
             if let Ok(owner) = Pubkey::try_from(account.owner) {
                 // Drop accounts from owners in the drop list, even during startup.
