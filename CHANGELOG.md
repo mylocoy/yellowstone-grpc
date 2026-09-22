@@ -10,6 +10,81 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ## [Unreleased]
 
+### Features
+
+- proto/plugin/client: added standalone Alpenglow block footer updates via the `block_footer` filter.
+
+- proto/plugin: added `bank_id` to `SubscribeUpdateBlock`, matching `SubscribeUpdateBlockMeta` and `SubscribeUpdateEntry`.
+
+## 2026-08-31
+
+- yellowstone-grpc-geyser 15.2.1
+
+### Misc
+
+- plugin: removed restrictive (crate) requirements
+
+## 2026-08-28
+
+- yellowstone-grpc-proto 12.7.0
+- yellowstone-grpc-geyser 15.2.0
+- yellowstone-grpc-client 13.5.0
+
+### Features
+
+- proto/plugin/client: added the `SubscribeGossip` method, which streams the validator's gossip contact info table. 
+
+### Misc
+
+- plugin: `SubscribeGossip` requires the plugin to be loaded when the validator starts. Agave does not replay the table to a plugin loaded later, so a hot-loaded plugin never builds a complete table.
+
+## 2026-08-25
+
+- yellowstone-grpc-client-nodejs 7.0.0
+- yellowstone-grpc-client 13.4.0
+
+### Fixes
+
+- Fixes backpressure issue [#854](https://github.com/rpcpool/yellowstone-grpc/issues/854)
+
+### Features
+
+- new `Mock` variant for `GeyserStream` in `yellowstone-grpc-client` when `test-tools` feature-flag is enabled.
+
+### Breaking
+
+- The `napi`'s `DuplexStream` and `DuplexStreamDeshred` `writes_raw` method now returns a `Promise` instead of being synchronous call.
+
+## 2026-08-19
+
+- yellowstone-grpc-client-nodejs-6.0.0
+
+### Features
+
+- added support for compressed transaction filters.
+- added support for token owner matching.
+
+### Breaking
+
+- nodejs: `6.0.0` bumps it's dependencies in package.json.
+
+
+## 2026-08-17
+
+- yellowstone-grpc-geyser 15.1.2
+
+### Fixes
+
+- plugin: performance optimization of account update filtering
+
+## 2026-08-13
+
+- yellowstone-grpc-geyser 15.1.1
+
+### Fixes
+
+- plugin: reconstruct V1 messages in `convert_from::create_message` instead of downgrading them to V0. `convert_to` already emits `Message.config` for V1, but `convert_from` only checked the `versioned` boolean, which is true for both V0 and V1
+
 ## 2026-08-10
 
 - yellowstone-grpc-proto 12.6.0

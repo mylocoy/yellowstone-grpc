@@ -1,6 +1,6 @@
 {
   "name": "@triton-one/yellowstone-grpc",
-  "version": "5.1.0",
+  "version": "7.0.1",
   "license": "Apache-2.0",
   "author": "Triton One",
   "description": "Yellowstone gRPC Geyser Node.js Client",
@@ -15,6 +15,7 @@
     "cp-napi-files-dev": "mkdir -p src/napi && mkdir -p dist/cjs/napi && mkdir -p dist/esm/napi && mkdir -p dist/types/napi && cp -r napi/*.node src/napi/ 2>/dev/null || true && cp -r napi/*.node dist/cjs/napi/ 2>/dev/null || true && cp -r napi/*.node dist/esm/napi/ 2>/dev/null || true && cp -r napi/index.d.ts src/napi 2>/dev/null || true && cp -r napi/index.d.ts dist/types/napi/ 2>/dev/null || true && cp -r napi/index.js src/napi 2>/dev/null || true && cp -r napi/index.js dist/cjs/napi/ 2>/dev/null || true && cp -r napi/index.js dist/esm/napi/ 2>/dev/null || true",
     "grpc-generate": "mkdir -p src/grpc && protoc -I../yellowstone-grpc-proto/proto --plugin=node_modules/.bin/protoc-gen-ts_proto --ts_proto_opt=forceLong=string --ts_proto_opt=outputServices=none --experimental_allow_proto3_optional --ts_proto_out=src/grpc geyser.proto --ts_proto_opt=esModuleInterop=true",
     "patch-napi-loader": "node napi/patch-napi-loader.js",
+    "pretest": "npm run build:napi && npm run cp-napi-files-dev",
     "fmt": "prettier -w .",
     "test": "jest --forceExit --runInBand"
   },
@@ -29,38 +30,40 @@
     "url": "https://github.com/rpcpool/yellowstone-grpc/issues"
   },
   "keywords": [
-    "solana"
+    "solana",
+    "grpc",
+    "yellowstone"
   ],
   "homepage": "https://triton.one",
   "dependencies": {
-    "@bufbuild/protobuf": "=2.10.2",
-    "@solana/rpc-api": "=5.1.0",
-    "@solana/addresses": "=5.1.0",
-    "@solana/rpc-types": "=5.1.0"
+    "@bufbuild/protobuf": "^2.12.0",
+    "@solana/addresses": "^7.0.0",
+    "@solana/rpc-api": "^7.0.0",
+    "@solana/rpc-types": "^7.0.0"
   },
   "optionalDependencies": {
-    "@triton-one/yellowstone-grpc-napi-linux-x64-gnu": "0.0.14",
-    "@triton-one/yellowstone-grpc-napi-linux-x64-musl": "0.0.14",
-    "@triton-one/yellowstone-grpc-napi-darwin-arm64": "0.0.14",
-    "@triton-one/yellowstone-grpc-napi-darwin-x64": "0.0.14"
+    "@triton-one/yellowstone-grpc-napi-darwin-arm64": "0.2.1",
+    "@triton-one/yellowstone-grpc-napi-darwin-x64": "0.2.1",
+    "@triton-one/yellowstone-grpc-napi-linux-x64-gnu": "0.2.1",
+    "@triton-one/yellowstone-grpc-napi-linux-x64-musl": "0.2.1"
   },
   "devDependencies": {
-    "@babel/core": "^7.28.5",
-    "@babel/parser": "^7.26.3",
-    "@babel/preset-env": "^7.28.5",
-    "@babel/preset-typescript": "^7.28.5",
-    "@napi-rs/cli": "^3.4.1",
+    "@babel/core": "^8.0.1",
+    "@babel/parser": "^8.0.4",
+    "@babel/preset-env": "^8.0.2",
+    "@babel/preset-typescript": "^8.0.1",
+    "@napi-rs/cli": "^3.7.3",
+    "@swc/core": "^1.15.43",
+    "@swc/jest": "^0.2.39",
     "@types/jest": "^30.0.0",
-    "babel-jest": "^30.2.0",
-    "dotenv": "^17.2.3",
-    "jest": "^30.2.0",
+    "@types/node": "^26.1.1",
+    "dotenv": "^17.4.2",
+    "jest": "^30.4.2",
     "jest-json-schema": "^6.1.0",
-    "prettier": "^3.7.4",
-    "recast": "^0.23.9",
-    "ts-jest": "^29.4.5",
-    "ts-proto": "^2.8.3",
-    "typescript": "=5.9.3",
-    "@types/node": "25.0.3"
+    "prettier": "^3.9.5",
+    "recast": "^0.23.12",
+    "ts-proto": "^2.12.0",
+    "typescript": "^7.0.2"
   },
   "napi": {
     "name": "yellowstone-grpc-napi",

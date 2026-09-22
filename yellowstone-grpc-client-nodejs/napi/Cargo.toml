@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-grpc-napi"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [lib]
@@ -41,6 +41,10 @@ home = { workspace = true }
 [build-dependencies]
 napi-build = { workspace = true }
 napi-sys = { workspace = true }
+
+[dev-dependencies]
+yellowstone-grpc-client = { workspace = true, features = ["test-tools"] }
+tonic = { workspace = true }
 
 [package.metadata.napi]
 name = "yellowstone-grpc-napi"

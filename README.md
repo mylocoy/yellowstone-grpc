@@ -449,6 +449,9 @@ It's possible to add limits for filters in the config. If the `filters` field is
       "blocks_meta": {
          "max": 1
       },
+      "block_footer": {
+         "max": 1
+      },
       "entry": {
          "max": 1
       }

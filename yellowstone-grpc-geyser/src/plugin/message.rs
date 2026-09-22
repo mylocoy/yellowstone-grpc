@@ -1,28 +1,29 @@
 use {
     super::convert_to,
     agave_geyser_plugin_interface::geyser_plugin_interface::{
-        ReplicaAccountInfoV3, ReplicaBlockInfoV4, ReplicaDeshredTransactionInfo,
-        ReplicaDeshredTransactionInfoV2, ReplicaDeshredTransactionInfoVersions, ReplicaEntryInfoV2,
-        ReplicaTransactionInfoV3, SlotStatus as GeyserSlotStatus,
+        ReplicaAccountInfoV3, ReplicaBlockFooterInfo, ReplicaBlockInfoV4, ReplicaContactInfoV0_0_1,
+        ReplicaDeshredTransactionInfo, ReplicaDeshredTransactionInfoV2,
+        ReplicaDeshredTransactionInfoVersions, ReplicaEntryInfoV2, ReplicaTransactionInfoV3,
+        SlotStatus as GeyserSlotStatus,
     },
     bytes::Bytes,
     foldhash::{HashSet as FoldHashSet, HashSetExt},
     prost_types::Timestamp,
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
+    solana_entry::block_component::VersionedBlockFooter,
     solana_hash::{Hash, HASH_BYTES},
     solana_pubkey::Pubkey,
     solana_signature::Signature,
     std::{
+        net::SocketAddr,
         ops::{Deref, DerefMut},
         sync::{Arc, OnceLock},
         time::SystemTime,
     },
     yellowstone_grpc_proto::{
         geyser::{
-            subscribe_update::UpdateOneof, CommitmentLevel as CommitmentLevelProto,
-            SlotStatus as SlotStatusProto, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
-            SubscribeUpdateBlock, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
-            SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+            CommitmentLevel as CommitmentLevelProto, SlotStatus as SlotStatusProto,
+            SubscribeUpdateBlockFooter, SubscribeUpdateBlockMeta,
         },
         solana::storage::confirmed_block,
     },
@@ -152,10 +153,17 @@ pub struct MessageSlot {
     pub status: SlotStatus,
     pub dead_error: Option<String>,
     pub created_at: Timestamp,
+    // FIRST_SHRED_RECEIVED and COMPLETED does not have any bank id.
+    pub bank_id: Option<BankId>,
 }
 
 impl MessageSlot {
-    pub fn from_geyser(slot: Slot, parent: Option<Slot>, status: &GeyserSlotStatus) -> Self {
+    pub fn from_geyser(
+        slot: Slot,
+        parent: Option<Slot>,
+        status: &GeyserSlotStatus,
+        bank_id: Option<BankId>,
+    ) -> Self {
         Self {
             slot,
             parent,
@@ -166,22 +174,8 @@ impl MessageSlot {
                 None
             },
             created_at: Timestamp::from(SystemTime::now()),
+            bank_id,
         }
-    }
-
-    pub fn from_update_oneof(
-        msg: &SubscribeUpdateSlot,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            slot: msg.slot,
-            parent: msg.parent,
-            status: SlotStatusProto::try_from(msg.status)
-                .map_err(|_| "failed to parse slot status")?
-                .into(),
-            dead_error: msg.dead_error.clone(),
-            created_at,
-        })
     }
 }
 
@@ -215,25 +209,6 @@ impl MessageAccountInfo {
         }
     }
 
-    pub fn from_update_oneof(msg: SubscribeUpdateAccountInfo) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            pubkey: Pubkey::try_from(msg.pubkey.as_slice()).map_err(|_| "invalid pubkey length")?,
-            lamports: msg.lamports,
-            owner: Pubkey::try_from(msg.owner.as_slice()).map_err(|_| "invalid owner length")?,
-            executable: msg.executable,
-            rent_epoch: msg.rent_epoch,
-            data: msg.data,
-            write_version: msg.write_version,
-            txn_signature: msg
-                .txn_signature
-                .map(|sig| {
-                    Signature::try_from(sig.as_slice()).map_err(|_| "invalid signature length")
-                })
-                .transpose()?,
-            pre_encoded: OnceLock::new(),
-        })
-    }
-
     pub fn get_pre_encoded(&self) -> Option<&Vec<u8>> {
         self.pre_encoded.get()
     }
@@ -244,45 +219,31 @@ pub struct MessageAccount {
     pub account: MessageAccountInfo,
     pub slot: Slot,
     pub is_startup: bool,
+    // startup account update has no bank id.
+    pub bank_id: Option<BankId>,
     pub created_at: Timestamp,
 }
 
 impl MessageAccount {
-    pub fn from_geyser(info: &ReplicaAccountInfoV3<'_>, slot: Slot, is_startup: bool) -> Self {
+    pub fn from_geyser(
+        info: &ReplicaAccountInfoV3<'_>,
+        slot: Slot,
+        is_startup: bool,
+        bank_id: Option<BankId>,
+    ) -> Self {
+        if is_startup {
+            assert!(
+                bank_id.is_none(),
+                "startup account update should have no bank id"
+            );
+        }
         Self {
             account: MessageAccountInfo::from_geyser(info),
             slot,
             is_startup,
+            bank_id,
             created_at: Timestamp::from(SystemTime::now()),
         }
-    }
-
-    pub fn from_update_oneof(
-        msg: SubscribeUpdateAccount,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            account: MessageAccountInfo::from_update_oneof(
-                msg.account.ok_or("account message should be defined")?,
-            )?,
-            slot: msg.slot,
-            is_startup: msg.is_startup,
-            created_at,
-        })
-    }
-
-    pub fn from_update_oneof_block(
-        msg: SubscribeUpdateAccountInfo,
-        slot: u64,
-        is_startup: bool,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            account: MessageAccountInfo::from_update_oneof(msg)?,
-            slot,
-            is_startup,
-            created_at,
-        })
     }
 }
 
@@ -339,23 +300,6 @@ impl MessageTransactionInfo {
         }
     }
 
-    pub fn from_update_oneof(msg: SubscribeUpdateTransactionInfo) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            signature: Signature::try_from(msg.signature.as_slice())
-                .map_err(|_| "invalid signature length")?,
-            is_vote: msg.is_vote,
-            transaction: msg
-                .transaction
-                .ok_or("transaction message should be defined")?,
-            meta: msg.meta.ok_or("meta message should be defined")?,
-            index: msg.index as usize,
-            account_keys: FoldHashSet::new(),
-            pre_encoded: OnceLock::new(),
-            token_owners_all: OnceLock::new(),
-            token_owners_changed: OnceLock::new(),
-        })
-    }
-
     pub fn fill_account_keys(&mut self) -> FromUpdateOneofResult<()> {
         let mut account_keys = FoldHashSet::new();
 
@@ -398,41 +342,17 @@ pub struct MessageTransaction {
     pub transaction: MessageTransactionInfo,
     pub slot: u64,
     pub created_at: Timestamp,
+    pub bank_id: BankId,
 }
 
 impl MessageTransaction {
-    pub fn from_geyser(info: &ReplicaTransactionInfoV3<'_>, slot: Slot) -> Self {
+    pub fn from_geyser(info: &ReplicaTransactionInfoV3<'_>, slot: Slot, bank_id: BankId) -> Self {
         Self {
             transaction: MessageTransactionInfo::from_geyser(info),
             slot,
             created_at: Timestamp::from(SystemTime::now()),
+            bank_id,
         }
-    }
-
-    pub fn from_update_oneof(
-        msg: SubscribeUpdateTransaction,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            transaction: MessageTransactionInfo::from_update_oneof(
-                msg.transaction
-                    .ok_or("transaction message should be defined")?,
-            )?,
-            slot: msg.slot,
-            created_at,
-        })
-    }
-
-    pub fn from_update_oneof_block(
-        msg: SubscribeUpdateTransactionInfo,
-        slot: u64,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            transaction: MessageTransactionInfo::from_update_oneof(msg)?,
-            slot,
-            created_at,
-        })
     }
 }
 
@@ -547,11 +467,12 @@ pub struct MessageEntry {
     pub hash: Hash,
     pub executed_transaction_count: u64,
     pub starting_transaction_index: u64,
+    pub bank_id: BankId,
     pub created_at: Timestamp,
 }
 
 impl MessageEntry {
-    pub fn from_geyser(info: &ReplicaEntryInfoV2) -> Self {
+    pub fn from_geyser(info: &ReplicaEntryInfoV2, bank_id: BankId) -> Self {
         Self {
             slot: info.slot,
             index: info.index,
@@ -563,25 +484,39 @@ impl MessageEntry {
                 .try_into()
                 .expect("failed convert usize to u64"),
             created_at: Timestamp::from(SystemTime::now()),
+            bank_id,
         }
     }
+}
 
-    pub fn from_update_oneof(
-        msg: &SubscribeUpdateEntry,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            slot: msg.slot,
-            index: msg.index as usize,
-            num_hashes: msg.num_hashes,
-            hash: Hash::new_from_array(
-                <[u8; HASH_BYTES]>::try_from(msg.hash.as_slice())
-                    .map_err(|_| "invalid hash length")?,
-            ),
-            executed_transaction_count: msg.executed_transaction_count,
-            starting_transaction_index: msg.starting_transaction_index,
-            created_at,
-        })
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageBlockFooter {
+    pub block_footer: SubscribeUpdateBlockFooter,
+    pub created_at: Timestamp,
+}
+
+impl Deref for MessageBlockFooter {
+    type Target = SubscribeUpdateBlockFooter;
+
+    fn deref(&self) -> &Self::Target {
+        &self.block_footer
+    }
+}
+
+impl MessageBlockFooter {
+    pub fn from_geyser(info: &ReplicaBlockFooterInfo<'_>, bank_id: BankId) -> Self {
+        let VersionedBlockFooter::V1(footer) = info.block_footer;
+
+        Self {
+            block_footer: SubscribeUpdateBlockFooter {
+                slot: info.slot,
+                bank_id,
+                bank_hash: footer.bank_hash.to_bytes().to_vec(),
+                block_producer_time_nanos: footer.block_producer_time_nanos,
+                block_user_agent: footer.block_user_agent.clone(),
+            },
+            created_at: Timestamp::from(SystemTime::now()),
+        }
     }
 }
 
@@ -606,7 +541,7 @@ impl DerefMut for MessageBlockMeta {
 }
 
 impl MessageBlockMeta {
-    pub fn from_geyser(info: &ReplicaBlockInfoV4<'_>) -> Self {
+    pub fn from_geyser(info: &ReplicaBlockInfoV4<'_>, bank_id: BankId) -> Self {
         Self {
             block_meta: SubscribeUpdateBlockMeta {
                 parent_slot: info.parent_slot,
@@ -621,6 +556,7 @@ impl MessageBlockMeta {
                 block_height: info.block_height.map(convert_to::create_block_height),
                 executed_transaction_count: info.executed_transaction_count,
                 entries_count: info.entry_count,
+                bank_id,
             },
             created_at: Timestamp::from(SystemTime::now()),
         }
@@ -663,51 +599,84 @@ impl MessageBlock {
             created_at: Timestamp::from(SystemTime::now()),
         }
     }
+}
 
-    pub fn from_update_oneof(
-        msg: SubscribeUpdateBlock,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(Self {
-            meta: Arc::new(MessageBlockMeta {
-                block_meta: SubscribeUpdateBlockMeta {
-                    slot: msg.slot,
-                    blockhash: msg.blockhash,
-                    rewards: msg.rewards,
-                    block_time: msg.block_time,
-                    block_height: msg.block_height,
-                    parent_slot: msg.parent_slot,
-                    parent_blockhash: msg.parent_blockhash,
-                    executed_transaction_count: msg.executed_transaction_count,
-                    entries_count: msg.entries_count,
-                },
-                created_at,
-            }),
-            transactions: msg
-                .transactions
-                .into_iter()
-                .map(|tx| {
-                    MessageTransaction::from_update_oneof_block(tx, msg.slot, created_at)
-                        .map(Arc::new)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            updated_account_count: msg.updated_account_count,
-            accounts: msg
-                .accounts
-                .into_iter()
-                .map(|account| {
-                    MessageAccount::from_update_oneof_block(account, msg.slot, false, created_at)
-                        .map(Arc::new)
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            entries: msg
-                .entries
-                .iter()
-                .map(|entry| MessageEntry::from_update_oneof(entry, created_at).map(Arc::new))
-                .collect::<Result<Vec<_>, _>>()?,
-            created_at,
-        })
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageContactInfo {
+    pub pubkey: Pubkey,
+    pub wallclock: u64,
+    pub outset: u64,
+    pub shred_version: u16,
+    pub version_major: u16,
+    pub version_minor: u16,
+    pub version_patch: u16,
+    pub version_commit: u32,
+    pub version_feature_set: u32,
+    pub version_client_id: u16,
+    pub gossip: Option<SocketAddr>,
+    pub tpu_quic: Option<SocketAddr>,
+    pub tpu_forwards_quic: Option<SocketAddr>,
+    pub tpu_vote_udp: Option<SocketAddr>,
+    pub tpu_vote_quic: Option<SocketAddr>,
+    pub tvu_udp: Option<SocketAddr>,
+    pub tvu_quic: Option<SocketAddr>,
+    pub serve_repair_udp: Option<SocketAddr>,
+    pub serve_repair_quic: Option<SocketAddr>,
+    pub rpc: Option<SocketAddr>,
+    pub rpc_pubsub: Option<SocketAddr>,
+    pub alpenglow: Option<SocketAddr>,
+    pub created_at: Timestamp,
+}
+
+impl MessageContactInfo {
+    pub fn from_geyser(info: &ReplicaContactInfoV0_0_1<'_>) -> Self {
+        Self {
+            pubkey: Pubkey::try_from(info.pubkey).expect("valid pubkey"),
+            wallclock: info.wallclock,
+            outset: info.outset,
+            shred_version: info.shred_version,
+            version_major: info.version_major,
+            version_minor: info.version_minor,
+            version_patch: info.version_patch,
+            version_commit: info.version_commit,
+            version_feature_set: info.version_feature_set,
+            version_client_id: info.version_client_id,
+            gossip: info.gossip,
+            tpu_quic: info.tpu_quic,
+            tpu_forwards_quic: info.tpu_forwards_quic,
+            tpu_vote_udp: info.tpu_vote_udp,
+            tpu_vote_quic: info.tpu_vote_quic,
+            tvu_udp: info.tvu_udp,
+            tvu_quic: info.tvu_quic,
+            serve_repair_udp: info.serve_repair_udp,
+            serve_repair_quic: info.serve_repair_quic,
+            rpc: info.rpc,
+            rpc_pubsub: info.rpc_pubsub,
+            alpenglow: info.alpenglow,
+            created_at: Timestamp::from(SystemTime::now()),
+        }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MessageContactInfoRemoved {
+    pub pubkey: Pubkey,
+    pub created_at: Timestamp,
+}
+
+impl MessageContactInfoRemoved {
+    pub fn from_geyser(pubkey: &[u8]) -> Self {
+        Self {
+            pubkey: Pubkey::try_from(pubkey).expect("valid pubkey"),
+            created_at: Timestamp::from(SystemTime::now()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContactInfoMessage {
+    Node(Arc<MessageContactInfo>),
+    Removed(Arc<MessageContactInfoRemoved>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -717,6 +686,7 @@ pub enum Message {
     Transaction(Arc<MessageTransaction>),
     DeshredTransaction(Arc<MessageDeshredTransaction>),
     Entry(Arc<MessageEntry>),
+    BlockFooter(Arc<MessageBlockFooter>),
     BlockMeta(Arc<MessageBlockMeta>),
     Block(Arc<MessageBlock>),
 }
@@ -730,39 +700,9 @@ impl Message {
             Self::Transaction(msg) => msg.slot,
             Self::DeshredTransaction(msg) => msg.slot,
             Self::Entry(msg) => msg.slot,
+            Self::BlockFooter(msg) => msg.slot,
             Self::BlockMeta(msg) => msg.slot,
             Self::Block(msg) => msg.meta.slot,
         }
-    }
-
-    pub fn from_update_oneof(
-        oneof: UpdateOneof,
-        created_at: Timestamp,
-    ) -> FromUpdateOneofResult<Self> {
-        Ok(match oneof {
-            UpdateOneof::Account(msg) => Self::Account(Arc::new(
-                MessageAccount::from_update_oneof(msg, created_at)?,
-            )),
-            UpdateOneof::Slot(msg) => {
-                Self::Slot(Arc::new(MessageSlot::from_update_oneof(&msg, created_at)?))
-            }
-            UpdateOneof::Transaction(msg) => Self::Transaction(Arc::new(
-                MessageTransaction::from_update_oneof(msg, created_at)?,
-            )),
-            UpdateOneof::TransactionStatus(_) => {
-                return Err("TransactionStatus message is not supported")
-            }
-            UpdateOneof::Block(msg) => {
-                Self::Block(Arc::new(MessageBlock::from_update_oneof(msg, created_at)?))
-            }
-            UpdateOneof::Ping(_) => return Err("Ping message is not supported"),
-            UpdateOneof::Pong(_) => return Err("Pong message is not supported"),
-            UpdateOneof::BlockMeta(msg) => Self::BlockMeta(Arc::new(
-                MessageBlockMeta::from_update_oneof(msg, created_at),
-            )),
-            UpdateOneof::Entry(msg) => {
-                Self::Entry(Arc::new(MessageEntry::from_update_oneof(&msg, created_at)?))
-            }
-        })
     }
 }

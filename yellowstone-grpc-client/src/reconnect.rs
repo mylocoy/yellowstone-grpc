@@ -568,6 +568,7 @@ pub(crate) fn extract_slot(msg: &SubscribeUpdate) -> Option<u64> {
         UpdateOneof::Block(m) => Some(m.slot),
         UpdateOneof::BlockMeta(m) => Some(m.slot),
         UpdateOneof::Entry(m) => Some(m.slot),
+        UpdateOneof::BlockFooter(m) => Some(m.slot),
         UpdateOneof::TransactionStatus(m) => Some(m.slot),
         UpdateOneof::Ping(_) | UpdateOneof::Pong(_) => None,
     }
@@ -691,6 +692,7 @@ mod tests {
                 }),
                 slot,
                 is_startup: false,
+                bank_id: Some(slot),
             })),
             created_at: None,
         }
@@ -852,6 +854,7 @@ mod tests {
                 parent: None,
                 status: 0,
                 dead_error: None,
+                bank_id: Some(42),
             })),
             created_at: None,
         };
@@ -886,6 +889,7 @@ mod tests {
                 parent: None,
                 status,
                 dead_error: None,
+                bank_id: Some(slot),
             })),
             created_at: None,
         }
@@ -905,6 +909,7 @@ mod tests {
                     parent_blockhash: String::new(),
                     executed_transaction_count: 0,
                     entries_count: 0,
+                    bank_id: slot,
                 },
             )),
             created_at: None,
@@ -1183,6 +1188,7 @@ mod tests {
                 }),
                 slot: 100,
                 is_startup: false,
+                bank_id: Some(100),
             })),
             created_at: None,
         };

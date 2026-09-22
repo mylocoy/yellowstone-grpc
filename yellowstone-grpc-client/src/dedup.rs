@@ -147,6 +147,7 @@ pub(crate) enum DedupKey {
     TransactionStatus(u64),              // index
     Entry(u64),                          // index
     BlockMeta(String),                   // blockhash,
+    BlockFooter(u64),                    // bank_id
     Block(u64),
     DeshredTransaction([u8; 64]), // signature
 }
@@ -206,6 +207,8 @@ impl Dedupable for SubscribeUpdate {
             }
             UpdateOneof::Entry(m) => Some((m.slot, DedupKey::Entry(m.index))),
             UpdateOneof::BlockMeta(m) => Some((m.slot, DedupKey::BlockMeta(m.blockhash.clone()))),
+            // One footer per bank, so a fork can produce several in the same slot.
+            UpdateOneof::BlockFooter(m) => Some((m.slot, DedupKey::BlockFooter(m.bank_id))),
             UpdateOneof::Block(m) => Some((m.slot, DedupKey::Block(m.slot))),
             UpdateOneof::Ping(_) | UpdateOneof::Pong(_) => None,
         }
@@ -362,8 +365,9 @@ mod tests {
     use {
         super::*,
         futures::{stream, StreamExt},
-        yellowstone_grpc_proto::prelude::{
-            subscribe_update::UpdateOneof, SubscribeUpdatePing, SubscribeUpdateSlot,
+        yellowstone_grpc_proto::{
+            geyser::SlotStatus::{SlotCompleted, SlotDead, SlotFirstShredReceived},
+            prelude::{subscribe_update::UpdateOneof, SubscribeUpdatePing, SubscribeUpdateSlot},
         },
     };
 
@@ -390,6 +394,17 @@ mod tests {
     }
 
     fn make_slot_msg(slot: u64, status: i32) -> SubscribeUpdate {
+        let bank_id = if [
+            SlotFirstShredReceived as i32,
+            SlotCompleted as i32,
+            SlotDead as i32,
+        ]
+        .contains(&status)
+        {
+            None
+        } else {
+            Some(slot)
+        };
         SubscribeUpdate {
             filters: vec![],
             update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
@@ -397,6 +412,7 @@ mod tests {
                 parent: None,
                 status,
                 dead_error: None,
+                bank_id,
             })),
             created_at: None,
         }
@@ -416,6 +432,7 @@ mod tests {
                     parent_blockhash: String::new(),
                     executed_transaction_count: 0,
                     entries_count: 0,
+                    bank_id: slot,
                 },
             )),
             created_at: None,
@@ -436,6 +453,7 @@ mod tests {
                     parent_blockhash: String::new(),
                     executed_transaction_count: 0,
                     entries_count: 0,
+                    bank_id: slot,
                 },
             )),
             created_at: None,
@@ -459,6 +477,7 @@ mod tests {
                     }),
                     slot,
                     is_startup: false,
+                    bank_id: Some(slot),
                 },
             )),
             created_at: None,

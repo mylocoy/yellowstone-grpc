@@ -5,8 +5,9 @@ use {
             TrustedMetadataAuthenticator,
         },
         billing::{BillingMeteredManager, HttpBillingEventSink},
-        block_reconstruction::BlockMachineStorage,
+        block_reconstruction_v2::BlockMachineStorage,
         config::{AuthConfig, AuthKind, BillingConfig, ConfigGrpc, GrpcAddress, GrpcTlsConfig},
+        contact_info::{self, ContactInfoState},
         file_watcher::FileWatcher,
         metered::PrometheusMeteredManager,
         metrics::{
@@ -59,7 +60,7 @@ use {
         time::{sleep, Duration},
     },
     tokio_rustls::{rustls, TlsAcceptor},
-    tokio_stream::wrappers::{UnboundedReceiverStream, UnixListenerStream},
+    tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream, UnixListenerStream},
     tokio_util::{sync::CancellationToken, task::TaskTracker},
     tonic::{
         metadata::AsciiMetadataValue,
@@ -75,8 +76,9 @@ use {
         CommitmentLevel as CommitmentLevelProto, GetBlockHeightRequest, GetBlockHeightResponse,
         GetLatestBlockhashRequest, GetLatestBlockhashResponse, GetSlotRequest, GetSlotResponse,
         GetVersionRequest, GetVersionResponse, IsBlockhashValidRequest, IsBlockhashValidResponse,
-        PingRequest, PongResponse, SubscribeDeshredRequest, SubscribeReplayInfoRequest,
-        SubscribeReplayInfoResponse, SubscribeRequest,
+        PingRequest, PongResponse, SubscribeDeshredRequest, SubscribeGossipRequest,
+        SubscribeReplayInfoRequest, SubscribeReplayInfoResponse, SubscribeRequest,
+        SubscribeUpdateGossip,
     },
     yellowstone_grpc_tools::server::{
         tcp::{TcpConfiguration, TcpIncoming as TritonTcpIncoming},
@@ -444,7 +446,7 @@ impl SubscriptionTracker {
 ///
 /// A permit that is owned by a subscriber. When the permit is dropped,
 /// it decrements the subscription count for the subscriber in the SubscriptionTracker.
-struct SubscriptionOwnedPermit {
+pub struct SubscriptionOwnedPermit {
     inner: Option<SubscriptionTracker>,
     key: String,
 }
@@ -677,6 +679,7 @@ pub struct GrpcService {
     snapshot_rx: Arc<Mutex<Option<crossbeam_channel::Receiver<Box<Message>>>>>,
     broadcast: SubscriberChannels,
     deshred_broadcast_tx: broadcast::Sender<DeshredBroadcastedMessage>,
+    contact_info_state: Arc<ContactInfoState>,
     replay_stored_slots_tx: Option<mpsc::Sender<ReplayStoredSlotsRequest>>,
     replay_first_available_slot: Option<Arc<AtomicU64>>,
     cancellation_token: CancellationToken,
@@ -825,6 +828,7 @@ pub struct GrpcServiceResult {
     pub snapshot_tx: Option<crossbeam_channel::Sender<Box<Message>>>,
     pub deshred_broadcast_tx: broadcast::Sender<DeshredBroadcastedMessage>,
     pub block_reconstruction_tx: mpsc::UnboundedSender<BlockReconstructionMessage>,
+    pub contact_info_tx: mpsc::UnboundedSender<contact_info::ContactInfoNotification>,
     pub broadcast: SubscriberChannels,
     pub blocks_meta_tx: Option<mpsc::UnboundedSender<Message>>,
 }
@@ -1035,6 +1039,16 @@ impl GrpcService {
                 (Some(Arc::new(AtomicU64::new(u64::MAX))), Some(tx), Some(rx))
             };
 
+        // contact info subscribers
+        let contact_info_state = ContactInfoState::new(config.contact_info_channel_capacity);
+
+        let (contact_info_tx, contact_info_rx) = mpsc::unbounded_channel();
+
+        task_tracker.spawn(contact_info::contact_info_loop(
+            UnboundedReceiverStream::new(contact_info_rx),
+            Arc::clone(&contact_info_state),
+        ));
+
         // Capture traffic reporting threshold before config is moved
         let traffic_reporting_threshold = config
             .traffic_reporting_byte_threhsold
@@ -1062,6 +1076,7 @@ impl GrpcService {
             snapshot_rx: Arc::new(Mutex::new(snapshot_rx)),
             broadcast: broadcast.clone(),
             deshred_broadcast_tx: deshred_broadcast_tx.clone(),
+            contact_info_state: Arc::clone(&contact_info_state),
             replay_stored_slots_tx,
             replay_first_available_slot: replay_first_available_slot.clone(),
             cancellation_token: service_cancellation_token.clone(),
@@ -1186,6 +1201,7 @@ impl GrpcService {
         Ok(GrpcServiceResult {
             snapshot_tx,
             deshred_broadcast_tx,
+            contact_info_tx,
             block_reconstruction_tx,
             broadcast,
             blocks_meta_tx,
@@ -1229,20 +1245,21 @@ impl GrpcService {
     ///
     /// Within a slot, if multiple updates arrive for the same account pubkey, only the update with
     /// the highest `write_version` is retained in the frozen block. This is handled internally by
-    /// `BlockMachineStorage` / `ProcessingSlot` and must not be bypassed.
+    /// `BlockMachineStorage` / `BankBuffer` and must not be bypassed.
     ///
     /// # Missing commitment level gap-filling
     ///
     /// If a higher commitment level arrives without a prior lower one (e.g. Finalized before
-    /// Confirmed), `BlocksStateMachine` synthesizes the missing levels in order
+    /// Confirmed), `BlockMachineStorage` synthesizes the missing levels in order
     /// (Processed → Confirmed → Finalized). Each synthesized level causes a separate
     /// `pop_ready_block` entry and a separate fan-out.
     ///
     /// # Ancestor slot propagation
     ///
-    /// When a descendant slot is finalized, `BlocksStateMachine` retroactively finalizes all
-    /// ancestor slots that were not yet finalized. This mirrors the parent-chain walk that
-    /// `geyser_loop` performs manually. It must not be short-circuited.
+    /// When a descendant slot reaches a commitment level, `BlockMachineStorage` retroactively
+    /// raises every ancestor slot (walked via its own tracked parent-slot chain) to at least
+    /// that same commitment level, emitting a synthesized update for any ancestor that hadn't
+    /// already reached it directly. It must not be short-circuited.
     ///
     /// # Batching and metrics
     ///
@@ -1405,7 +1422,8 @@ impl GrpcService {
                                 solana_commitment_config::CommitmentLevel::Finalized => SlotStatus::Finalized,
                             },
                             dead_error: None,
-                            created_at: Timestamp::from(SystemTime::now())
+                            created_at: Timestamp::from(SystemTime::now()),
+                            bank_id: Some(slot_update.bank_id),
                         }));
 
                         let slot_message_singleton_vec = Arc::new(vec![slot_message]);
@@ -1463,6 +1481,7 @@ impl GrpcService {
                                 },
                                 dead_error: None,
                                 created_at,
+                                bank_id: Some(slot_update.bank_id),
                             }));
                             replayed_messages.push(ReplayResponseMessageType::Single(slot_message));
                         }
@@ -2034,6 +2053,7 @@ impl GrpcService {
 impl Geyser for GrpcService {
     type SubscribeStream = LoadAwareReceiver<TonicResult<FilteredUpdate>>;
     type SubscribeDeshredStream = LoadAwareReceiver<TonicResult<FilteredUpdateDeshred>>;
+    type SubscribeGossipStream = ReceiverStream<TonicResult<SubscribeUpdateGossip>>;
 
     async fn subscribe(
         &self,
@@ -2365,6 +2385,57 @@ impl Geyser for GrpcService {
         Ok(Response::new(stream_rx))
     }
 
+    async fn subscribe_gossip(
+        &self,
+        request: Request<SubscribeGossipRequest>,
+    ) -> TonicResult<Response<Self::SubscribeGossipStream>> {
+        incr_grpc_method_call_count("subscribe_gossip");
+
+        let subscriber_id = request
+            .extensions()
+            .get::<SubscriptionInfo>()
+            .cloned()
+            .map(|info| info.subscription_id)
+            .or_else(|| {
+                request
+                    .metadata()
+                    .get("x-subscription-id")
+                    .and_then(|h| h.to_str().ok().map(|s| s.to_string()))
+                    .or_else(|| request.remote_addr().map(|addr| addr.ip().to_string()))
+            });
+
+        let subscription_permit = if let Some(id) = subscriber_id.as_deref() {
+            match self.subscription_tracker.try_insert(id.to_owned()) {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    return Err(Status::resource_exhausted(
+                        "max subscription limit exceeded",
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+
+        let id = self.next_subscribe_seq_id();
+        let client_cancellation_token = self.cancellation_token.child_token();
+        if client_cancellation_token.is_cancelled() {
+            return Err(Status::unavailable("server is shutting down"));
+        }
+
+        let stream_rx = contact_info::grpc::spawn_subscriber(
+            id,
+            subscriber_id,
+            subscription_permit,
+            self.config_channel_capacity,
+            Arc::clone(&self.contact_info_state),
+            client_cancellation_token,
+            self.task_tracker.clone(),
+        );
+
+        Ok(Response::new(stream_rx))
+    }
+
     async fn subscribe_first_available_slot(
         &self,
         _request: Request<SubscribeReplayInfoRequest>,
@@ -2511,6 +2582,7 @@ mod tests {
             status: SlotStatus::Processed,
             dead_error: None,
             created_at: Timestamp::from(SystemTime::now()),
+            bank_id: Some(slot),
         }))])
     }
 
@@ -2695,6 +2767,7 @@ mod tests {
             status: SlotStatus::Processed,
             dead_error: None,
             created_at: Timestamp::from(SystemTime::now()),
+            bank_id: Some(100),
         }));
         broadcast.send(CommitmentLevel::Processed, Arc::new(vec![msg]));
 
@@ -2857,12 +2930,24 @@ mod tests {
         }
 
         fn make_slot(slot: u64, status: SlotStatus, parent: Option<u64>) -> Message {
+            let bank_id = if [
+                SlotStatus::Completed,
+                SlotStatus::Dead,
+                SlotStatus::FirstShredReceived,
+            ]
+            .contains(&status)
+            {
+                None
+            } else {
+                Some(slot)
+            };
             Message::Slot(Arc::new(MessageSlot {
                 slot,
                 parent,
                 status,
                 dead_error: None,
                 created_at: Timestamp::from(SystemTime::now()),
+                bank_id,
             }))
         }
 

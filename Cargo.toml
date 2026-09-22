@@ -59,10 +59,10 @@ local-ip-address = "0.6.1"
 log = "0.4.17"
 maplit = "1.0.2"
 moka = "0.12.0"
-napi = "3.4.0"
+napi = "3.10.0"
 napi-build = "2.2.4"
 napi-derive = "3.3.0"
-napi-derive-backend = "3.0.0"
+napi-derive-backend = "5.1.0"
 napi-sys = "3.0.1"
 num_cpus = "1.16.0"
 parking_lot = "0.12"
@@ -99,16 +99,17 @@ tonic-health = "0.14.0"
 url = "2.5.0"
 uuid = "1"
 vergen = "9.0.6"
-wincode = "0.5.0"
+wincode = "0.6.1"
 notify = "8.2.0"
 
 # Agave Monorepo
-agave-geyser-plugin-interface = "4.2.0"
-solana-account-decoder = "4.2.0"
+agave-geyser-plugin-interface = "4.3.0"
+solana-account-decoder = "4.3.0"
+solana-entry = "4.3.0"
 solana-logger = "3.0.0"
-solana-storage-proto = "4.2.0"
-solana-transaction-context = "4.2.0"
-solana-transaction-status = "4.2.0"
+solana-storage-proto = "4.3.0"
+solana-transaction-context = "4.3.0"
+solana-transaction-status = "4.3.0"
 
 # Solana SDK
 solana-message = "4.4.1"
@@ -131,16 +132,15 @@ spl-token-2022-interface = "2.1.0"
 
 # Yellowstone
 yellowstone-block-machine = { version = "0.9.0", default-features = false }
-yellowstone-grpc-client = { path = "yellowstone-grpc-client", version = "13.3.0" }
-yellowstone-grpc-geyser = { path = "yellowstone-grpc-geyser", version = "15.1.0" }
-yellowstone-grpc-proto = { path = "yellowstone-grpc-proto", version = "12.6.0", default-features = false }
+yellowstone-grpc-client = { path = "yellowstone-grpc-client", version = "13.5.0" }
+yellowstone-grpc-geyser = { path = "yellowstone-grpc-geyser", version = "16.0.0-rc10+solana.4.3.0" }
+yellowstone-grpc-proto = { path = "yellowstone-grpc-proto", version = "13.0.0-rc4", default-features = false }
 yellowstone-grpc-e2e-macros = { path = "yellowstone-grpc-e2e-macros", version = "0.1.0" }
 yellowstone-grpc-tools = { path = "yellowstone-grpc-tools", version = "0.1.0" }
 
 # tokio-grpc-tools
 tokio-rustls = "0.26.0"
 x509-parser = "0.18.0"
-
 
 [workspace.lints.clippy]
 clone_on_ref_ptr = "deny"
