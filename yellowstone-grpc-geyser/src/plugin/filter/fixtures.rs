@@ -19,7 +19,11 @@ use {
         time::Duration,
     },
     yellowstone_grpc_proto::{
-        geyser::{SubscribeUpdateBlockFooter, SubscribeUpdateBlockMeta},
+        geyser::{
+            BlockFooterFinalCert, BlockFooterNotarRewardCert, BlockFooterSignatureKind,
+            BlockFooterSkipRewardCert, BlockFooterVotesAggregate, SubscribeUpdateBlockFooter,
+            SubscribeUpdateBlockMeta,
+        },
         solana::storage::confirmed_block,
     },
 };
@@ -131,9 +135,43 @@ pub fn message_block_footer(slot: u64, bank_id: u64) -> Arc<MessageBlockFooter> 
             bank_hash: vec![1; 32],
             block_producer_time_nanos: 1_000,
             block_user_agent: b"agave".to_vec(),
+            block_final_cert: None,
+            skip_reward_cert: None,
+            notar_reward_cert: None,
         },
         created_at: Timestamp::default(),
     })
+}
+
+pub fn block_footer_certificates() -> (
+    BlockFooterFinalCert,
+    BlockFooterSkipRewardCert,
+    BlockFooterNotarRewardCert,
+) {
+    let aggregate = |byte, block_id| BlockFooterVotesAggregate {
+        signature_kind: BlockFooterSignatureKind::CompressedBls12381G2.into(),
+        signature: vec![byte; 96],
+        block_id,
+        signer_bitmap: vec![byte; 3],
+    };
+    (
+        BlockFooterFinalCert {
+            slot: 42,
+            final_aggregate: Some(aggregate(1, Vec::new())),
+            notar_aggregate: Some(aggregate(2, vec![4; 32])),
+        },
+        BlockFooterSkipRewardCert {
+            slot: 42,
+            aggregate: Some(BlockFooterVotesAggregate {
+                signer_bitmap: Vec::new(),
+                ..aggregate(3, Vec::new())
+            }),
+        },
+        BlockFooterNotarRewardCert {
+            slot: 42,
+            aggregate: Some(aggregate(4, vec![5; 32])),
+        },
+    )
 }
 
 pub fn message_block_meta(slot: u64) -> Arc<MessageBlockMeta> {
@@ -159,6 +197,7 @@ pub fn message_block(
 ) -> Arc<MessageBlock> {
     Arc::new(MessageBlock {
         meta: message_block_meta(slot),
+        created_bank: Arc::new(message_slot(slot, SlotStatus::CreatedBank)),
         updated_account_count: accounts.len() as u64,
         transactions,
         accounts,

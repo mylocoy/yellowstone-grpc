@@ -1,6 +1,15 @@
 use {
+    agave_votor_messages::{
+        certificate::CertSignature,
+        reward_certificate::{NotarRewardCertificate, SkipRewardCertificate},
+    },
     solana_account::Account,
     solana_account_decoder::parse_token::UiTokenAmount,
+    solana_bls_signatures::{
+        Signature as BLSSignature, SignatureCompressed as BLSSignatureCompressed,
+        BLS_SIGNATURE_COMPRESSED_SIZE,
+    },
+    solana_entry::block_component::{BlockFinalizationCert, VotesAggregate},
     solana_hash::{Hash, HASH_BYTES},
     solana_message::{
         compiled_instruction::CompiledInstruction,
@@ -191,8 +200,16 @@ pub fn create_tx_meta(meta: proto::TransactionStatusMeta) -> CreateResult<Transa
         fee: meta.fee,
         pre_balances: meta.pre_balances,
         post_balances: meta.post_balances,
-        inner_instructions: Some(create_meta_inner_instructions(meta.inner_instructions)?),
-        log_messages: Some(meta.log_messages),
+        inner_instructions: if meta.inner_instructions_none {
+            None
+        } else {
+            Some(create_meta_inner_instructions(meta.inner_instructions)?)
+        },
+        log_messages: if meta.log_messages_none {
+            None
+        } else {
+            Some(meta.log_messages)
+        },
         pre_token_balances: Some(create_token_balances(meta.pre_token_balances)?),
         post_token_balances: Some(create_token_balances(meta.post_token_balances)?),
         rewards: Some(meta_rewards),
@@ -271,17 +288,19 @@ pub fn create_reward(reward: proto::Reward) -> CreateResult<Reward> {
         pubkey: reward.pubkey,
         lamports: reward.lamports,
         post_balance: reward.post_balance,
-        reward_type: match proto::RewardType::try_from(reward.reward_type)
-            .map_err(|_| "failed to parse reward_type")?
-        {
-            proto::RewardType::Unspecified => None,
-            proto::RewardType::Fee => Some(RewardType::Fee),
-            proto::RewardType::Rent => Some(RewardType::Rent),
-            proto::RewardType::Staking => Some(RewardType::Staking),
-            proto::RewardType::Voting => Some(RewardType::Voting),
-            proto::RewardType::DeactivatedStake => Some(RewardType::DeactivatedStake),
-            proto::RewardType::VatDebit => Some(RewardType::VATDebit),
-        },
+        // Unknown values decode as None, like agave's storage-proto, so a reward type added
+        // by a newer validator does not fail the whole block.
+        reward_type: proto::RewardType::try_from(reward.reward_type)
+            .ok()
+            .and_then(|reward_type| match reward_type {
+                proto::RewardType::Unspecified => None,
+                proto::RewardType::Fee => Some(RewardType::Fee),
+                proto::RewardType::Rent => Some(RewardType::Rent),
+                proto::RewardType::Staking => Some(RewardType::Staking),
+                proto::RewardType::Voting => Some(RewardType::Voting),
+                proto::RewardType::DeactivatedStake => Some(RewardType::DeactivatedStake),
+                proto::RewardType::VatDebit => Some(RewardType::VATDebit),
+            }),
         commission: if reward.commission.is_empty() {
             None
         } else {
@@ -374,4 +393,304 @@ pub fn create_account(
         rent_epoch: account.rent_epoch,
     };
     Ok((pubkey, account))
+}
+
+// The block_id sits on the notarize aggregate in a slow finalization, and on the final one in a fast one.
+pub fn create_block_final_cert(
+    cert: &proto::BlockFooterFinalCert,
+) -> CreateResult<BlockFinalizationCert> {
+    let final_aggregate = cert
+        .final_aggregate
+        .as_ref()
+        .ok_or("failed to get final_aggregate")?;
+    let block_aggregate = cert.notar_aggregate.as_ref().unwrap_or(final_aggregate);
+    Ok(BlockFinalizationCert {
+        slot: cert.slot,
+        block_id: create_hash(&block_aggregate.block_id)?,
+        final_aggregate: create_votes_aggregate(final_aggregate)?,
+        notar_aggregate: cert
+            .notar_aggregate
+            .as_ref()
+            .map(create_votes_aggregate)
+            .transpose()?,
+    })
+}
+
+fn create_votes_aggregate(
+    aggregate: &proto::BlockFooterVotesAggregate,
+) -> CreateResult<VotesAggregate> {
+    let signature = BLSSignature::try_from(create_bls_signature(aggregate)?)
+        .map_err(|_| "failed to decompress BLS signature")?;
+    Ok(VotesAggregate::from_cert_signature(CertSignature {
+        signature,
+        bitmap: aggregate.signer_bitmap.clone(),
+    }))
+}
+
+pub fn create_skip_reward_cert(
+    cert: &proto::BlockFooterSkipRewardCert,
+) -> CreateResult<SkipRewardCertificate> {
+    let aggregate = cert.aggregate.as_ref().ok_or("failed to get aggregate")?;
+    SkipRewardCertificate::try_new(
+        cert.slot,
+        create_bls_signature(aggregate)?,
+        aggregate.signer_bitmap.clone(),
+    )
+    .map_err(|_| "failed to create skip reward cert")
+}
+
+pub fn create_notar_reward_cert(
+    cert: &proto::BlockFooterNotarRewardCert,
+) -> CreateResult<NotarRewardCertificate> {
+    let aggregate = cert.aggregate.as_ref().ok_or("failed to get aggregate")?;
+    NotarRewardCertificate::try_new(
+        cert.slot,
+        create_hash(&aggregate.block_id)?,
+        create_bls_signature(aggregate)?,
+        aggregate.signer_bitmap.clone(),
+    )
+    .map_err(|_| "failed to create notar reward cert")
+}
+
+fn create_hash(hash: &[u8]) -> CreateResult<Hash> {
+    <[u8; HASH_BYTES]>::try_from(hash)
+        .map(Hash::new_from_array)
+        .map_err(|_| "failed to parse hash")
+}
+
+fn create_bls_signature(
+    aggregate: &proto::BlockFooterVotesAggregate,
+) -> CreateResult<BLSSignatureCompressed> {
+    // try_from rejects unknown kinds; the signature_kind() getter would map them to BLS.
+    match proto::BlockFooterSignatureKind::try_from(aggregate.signature_kind) {
+        Ok(proto::BlockFooterSignatureKind::CompressedBls12381G2) => {}
+        Err(_) => return Err("unsupported signature kind"),
+    }
+    <[u8; BLS_SIGNATURE_COMPRESSED_SIZE]>::try_from(aggregate.signature.as_slice())
+        .map(BLSSignatureCompressed)
+        .map_err(|_| "failed to parse BLS signature")
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{
+            create_block_final_cert, create_notar_reward_cert, create_reward,
+            create_skip_reward_cert, create_tx_meta,
+        },
+        crate::plugin::convert_to,
+        agave_geyser_plugin_interface::block_footer as plugin,
+        agave_votor_messages::{
+            certificate::CertSignature,
+            reward_certificate::{NotarRewardCertificate, SkipRewardCertificate},
+        },
+        solana_bls_signatures::{
+            keypair::Keypair, Signature as BLSSignature,
+            SignatureCompressed as BLSSignatureCompressed,
+        },
+        solana_entry::block_component::{BlockFinalizationCert, VotesAggregate},
+        solana_hash::Hash,
+        solana_transaction_status::RewardType,
+        yellowstone_grpc_proto::prelude as proto,
+    };
+
+    fn bls_signature(seed: u8) -> BLSSignature {
+        let keypair = Keypair::derive(&[seed; 32]).unwrap();
+        BLSSignature::from(&keypair.sign(b"block footer"))
+    }
+
+    fn votes_aggregate(seed: u8, bitmap: Vec<u8>) -> VotesAggregate {
+        VotesAggregate::from_cert_signature(CertSignature {
+            signature: bls_signature(seed),
+            bitmap,
+        })
+    }
+
+    // convert_to takes the plugin interface's borrowed mirrors of the agave types.
+    fn plugin_aggregate(aggregate: &VotesAggregate) -> plugin::VotesAggregate<'_> {
+        plugin::VotesAggregate {
+            signature: *aggregate.signature(),
+            bitmap: aggregate.bitmap(),
+        }
+    }
+
+    fn plugin_final_cert(cert: &BlockFinalizationCert) -> plugin::BlockFinalizationCert<'_> {
+        plugin::BlockFinalizationCert {
+            slot: cert.slot,
+            block_id: cert.block_id,
+            final_aggregate: plugin_aggregate(&cert.final_aggregate),
+            notar_aggregate: cert.notar_aggregate.as_ref().map(plugin_aggregate),
+        }
+    }
+
+    #[test]
+    fn block_final_cert_round_trip() {
+        let block_id = Hash::new_from_array([4; 32]);
+        for notar_aggregate in [None, Some(votes_aggregate(2, vec![1, 6, 0, 9]))] {
+            let slow = notar_aggregate.is_some();
+            let cert = BlockFinalizationCert {
+                slot: 42,
+                block_id,
+                final_aggregate: votes_aggregate(1, vec![0, 10, 0, 0b1101, 0b11]),
+                notar_aggregate,
+            };
+            let proto = convert_to::create_block_final_cert(&plugin_final_cert(&cert));
+            let final_aggregate = proto.final_aggregate.as_ref().unwrap();
+            assert_eq!(final_aggregate.signature.len(), 96);
+            assert_eq!(final_aggregate.signer_bitmap, vec![0, 10, 0, 0b1101, 0b11]);
+            if slow {
+                assert!(final_aggregate.block_id.is_empty());
+                assert_eq!(
+                    proto.notar_aggregate.as_ref().unwrap().block_id,
+                    block_id.to_bytes()
+                );
+            } else {
+                assert_eq!(final_aggregate.block_id, block_id.to_bytes());
+            }
+            assert_eq!(create_block_final_cert(&proto).unwrap(), cert);
+        }
+    }
+
+    #[test]
+    fn reward_certs_round_trip() {
+        let signature = BLSSignatureCompressed::try_from(&bls_signature(3)).unwrap();
+        let skip = SkipRewardCertificate::try_new(42, signature, vec![1, 6, 0, 9]).unwrap();
+        let proto = convert_to::create_skip_reward_cert(&plugin::SkipRewardCertificate {
+            slot: skip.slot,
+            signature: skip.signature,
+            bitmap: skip.to_bitmap(),
+        });
+        assert!(proto.aggregate.as_ref().unwrap().block_id.is_empty());
+        assert_eq!(create_skip_reward_cert(&proto).unwrap(), skip);
+
+        let notar = NotarRewardCertificate::try_new(
+            43,
+            Hash::new_from_array([5; 32]),
+            signature,
+            Vec::new(),
+        )
+        .unwrap();
+        let proto = convert_to::create_notar_reward_cert(&plugin::NotarRewardCertificate {
+            slot: notar.slot,
+            block_id: notar.block_id,
+            signature: notar.signature,
+            bitmap: notar.bitmap(),
+        });
+        assert_eq!(proto.aggregate.as_ref().unwrap().block_id, vec![5; 32]);
+        assert_eq!(create_notar_reward_cert(&proto).unwrap(), notar);
+    }
+
+    #[test]
+    fn block_final_cert_rejects_malformed_fields() {
+        let fast =
+            convert_to::create_block_final_cert(&plugin_final_cert(&BlockFinalizationCert {
+                slot: 42,
+                block_id: Hash::new_from_array([4; 32]),
+                final_aggregate: votes_aggregate(1, Vec::new()),
+                notar_aggregate: None,
+            }));
+
+        let mut cert = fast.clone();
+        cert.final_aggregate.as_mut().unwrap().block_id.pop();
+        assert!(create_block_final_cert(&cert).is_err());
+
+        let mut cert = fast.clone();
+        cert.final_aggregate = None;
+        assert!(create_block_final_cert(&cert).is_err());
+
+        // A slow finalization takes its block_id from the notarize aggregate.
+        let mut cert = fast.clone();
+        cert.notar_aggregate = cert.final_aggregate.clone();
+        cert.notar_aggregate.as_mut().unwrap().block_id.clear();
+        assert!(create_block_final_cert(&cert).is_err());
+
+        let mut cert = fast.clone();
+        // A future kind this reader does not know.
+        cert.final_aggregate.as_mut().unwrap().signature_kind = 1;
+        assert!(create_block_final_cert(&cert).is_err());
+
+        let mut cert = fast;
+        cert.final_aggregate.as_mut().unwrap().signature = vec![0xff; 96];
+        assert!(create_block_final_cert(&cert).is_err());
+    }
+
+    fn base_proto_meta() -> proto::TransactionStatusMeta {
+        proto::TransactionStatusMeta {
+            return_data_none: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tx_meta_respects_none_flags_set() {
+        let meta = create_tx_meta(proto::TransactionStatusMeta {
+            inner_instructions_none: true,
+            log_messages_none: true,
+            ..base_proto_meta()
+        })
+        .expect("failed to create meta");
+
+        assert_eq!(meta.inner_instructions, None);
+        assert_eq!(meta.log_messages, None);
+    }
+
+    #[test]
+    fn tx_meta_respects_none_flags_unset() {
+        let log_messages = vec!["Program log: hello".to_owned()];
+        let meta = create_tx_meta(proto::TransactionStatusMeta {
+            inner_instructions_none: false,
+            log_messages_none: false,
+            log_messages: log_messages.clone(),
+            ..base_proto_meta()
+        })
+        .expect("failed to create meta");
+
+        assert_eq!(meta.inner_instructions, Some(vec![]));
+        assert_eq!(meta.log_messages, Some(log_messages));
+    }
+
+    fn base_proto_reward(reward_type: i32) -> proto::Reward {
+        proto::Reward {
+            pubkey: "11111111111111111111111111111111".to_owned(),
+            lamports: 1_000,
+            post_balance: 50_000,
+            reward_type,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reward_type_known_values_are_decoded() {
+        for (proto_type, expected) in [
+            (proto::RewardType::Unspecified, None),
+            (
+                proto::RewardType::DeactivatedStake,
+                Some(RewardType::DeactivatedStake),
+            ),
+            (proto::RewardType::VatDebit, Some(RewardType::VATDebit)),
+        ] {
+            let reward = create_reward(base_proto_reward(proto_type as i32))
+                .expect("failed to create reward");
+            assert_eq!(reward.reward_type, expected);
+        }
+    }
+
+    #[test]
+    fn reward_type_unknown_value_decodes_as_none() {
+        let reward = create_reward(base_proto_reward(99)).expect("failed to create reward");
+
+        assert_eq!(reward.reward_type, None);
+    }
+
+    #[test]
+    fn vat_debit_keeps_negative_lamports() {
+        let reward = create_reward(proto::Reward {
+            lamports: -1_000,
+            ..base_proto_reward(proto::RewardType::VatDebit as i32)
+        })
+        .expect("failed to create reward");
+
+        assert_eq!(reward.lamports, -1_000);
+        assert_eq!(reward.reward_type, Some(RewardType::VATDebit));
+    }
 }

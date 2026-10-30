@@ -15,7 +15,11 @@ ignore = [
     # Advisory: https://rustsec.org/advisories/RUSTSEC-2025-0141
     "RUSTSEC-2025-0141",
 
-    # time 0.3.45 — fix (>=0.3.47) requires Rust 1.88.0, we are on 1.86.0
-    # Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0009
-    "RUSTSEC-2026-0009",
+    # zstd 0.13.3 and zstd-safe 7.3.0, pinned by agave 4.3.2 and tonic 0.14.6
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0391
+    "RUSTSEC-2026-0391",
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0398
+    "RUSTSEC-2026-0398",
+    # Advisory: https://rustsec.org/advisories/RUSTSEC-2026-0403
+    "RUSTSEC-2026-0403",
 ]

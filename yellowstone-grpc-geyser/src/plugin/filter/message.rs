@@ -9,8 +9,9 @@ use {
             },
             message::{
                 MessageAccount, MessageAccountInfo, MessageBlockFooter, MessageBlockMeta,
-                MessageDeshredTransaction, MessageDeshredTransactionInfo, MessageEntry,
-                MessageSlot, MessageTransaction, MessageTransactionInfo,
+                MessageDeshredTransaction, MessageDeshredTransactionInfo,
+                MessageDeshredUpdateParent, MessageEntry, MessageEntryUpdateParent, MessageSlot,
+                MessageTransaction, MessageTransactionInfo,
             },
         },
     },
@@ -69,6 +70,119 @@ macro_rules! prost_repeated_encoded_len_map {
                 .map(|len| encoded_len_varint(len as u64) + len)
                 .sum::<usize>()
     }};
+}
+
+/// Bytes of account data that add one weight unit to an account by default.
+pub const DEFAULT_ACCOUNT_DATA_UNIT: usize = 4096;
+
+pub const DEFAULT_TRANSACTION_DATA_UNIT: usize = 4096;
+
+/// Weight of each update kind in a Subscribe queue. Scales below `1` count as `1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WeightScales {
+    /// Multiplies an account update's weight, which is the account's units.
+    pub account: u32,
+    pub transaction: u32,
+    pub entry: u32,
+    pub slot: u32,
+    pub block_footer: u32,
+    /// Multiplies a block's weight, which is `1` plus its transactions and its accounts' units.
+    pub block: u32,
+    /// An account counts `1` unit plus one per this many bytes of data. `0` counts it as `1`.
+    pub account_data_unit: usize,
+    pub transaction_data_unit: usize,
+}
+
+impl Default for WeightScales {
+    fn default() -> Self {
+        Self {
+            account: 1,
+            transaction: 1,
+            entry: 1,
+            slot: 1,
+            block_footer: 1,
+            block: 1,
+            account_data_unit: DEFAULT_ACCOUNT_DATA_UNIT,
+            transaction_data_unit: DEFAULT_TRANSACTION_DATA_UNIT,
+        }
+    }
+}
+
+fn data_units(count: usize, len: usize, unit: usize) -> u32 {
+    let units = if count == 0 {
+        0
+    } else {
+        len.checked_div(unit).map_or(count, |units| units.max(1))
+    };
+    u32::try_from(units).unwrap_or(u32::MAX)
+}
+
+impl WeightScales {
+    /// Counts the full data, even under a data slice, because the queue holds the whole account.
+    fn account_units(&self, account: &MessageAccount) -> u32 {
+        let extra = account
+            .account
+            .data
+            .len()
+            .checked_div(self.account_data_unit)
+            .unwrap_or_default();
+        u32::try_from(extra).unwrap_or(u32::MAX).saturating_add(1)
+    }
+
+    /// Weighs a [`FilteredUpdate`] with these scales.
+    ///
+    /// # Arguments
+    ///
+    /// * `update` - The [`FilteredUpdate`] to weigh.
+    ///
+    /// # Returns
+    ///
+    /// The weight of `update`. Transaction status, block meta, ping and pong updates always
+    /// weigh `1`.
+    pub(crate) fn update_weight(&self, update: &FilteredUpdate) -> u32 {
+        let scale = match &update.message {
+            FilteredUpdateOneof::Account(update) => {
+                return self
+                    .account
+                    .max(1)
+                    .saturating_mul(self.account_units(&update.account));
+            }
+            FilteredUpdateOneof::Transaction(update) => {
+                let units = update
+                    .transaction
+                    .transaction
+                    .get_pre_encoded()
+                    .map_or(1, |encoded| {
+                        data_units(1, encoded.len(), self.transaction_data_unit)
+                    });
+                return self.transaction.max(1).saturating_mul(units);
+            }
+            FilteredUpdateOneof::Entry(_) | FilteredUpdateOneof::EntryUpdateParent(_) => self.entry,
+            FilteredUpdateOneof::Slot(_) => self.slot,
+            FilteredUpdateOneof::BlockFooter(_) => self.block_footer,
+            FilteredUpdateOneof::Block(block) => {
+                let transactions = self.transaction.max(1).saturating_mul(data_units(
+                    block.transactions.len(),
+                    block.transactions_data_len,
+                    self.transaction_data_unit,
+                ));
+                let accounts = self.account.max(1).saturating_mul(data_units(
+                    block.accounts.len(),
+                    block.accounts_data_len,
+                    self.account_data_unit,
+                ));
+                return transactions
+                    .saturating_add(accounts)
+                    .saturating_add(1)
+                    .saturating_mul(self.block.max(1));
+            }
+            FilteredUpdateOneof::TransactionStatus(_)
+            | FilteredUpdateOneof::BlockMeta(_)
+            | FilteredUpdateOneof::Ping
+            | FilteredUpdateOneof::Pong(_) => 1,
+        };
+        scale.max(1)
+    }
 }
 
 pub type FilteredUpdates = SmallVec<[FilteredUpdate; 2]>;
@@ -245,6 +359,9 @@ impl FilteredUpdate {
             FilteredUpdateOneof::Ping => UpdateOneof::Ping(SubscribeUpdatePing {}),
             FilteredUpdateOneof::Pong(msg) => UpdateOneof::Pong(*msg),
             FilteredUpdateOneof::BlockMeta(msg) => UpdateOneof::BlockMeta(msg.block_meta.clone()),
+            FilteredUpdateOneof::EntryUpdateParent(msg) => {
+                UpdateOneof::EntryUpdateParent(msg.update_parent.clone())
+            }
             FilteredUpdateOneof::Entry(msg) => {
                 UpdateOneof::Entry(Self::as_subscribe_update_entry(&msg.0))
             }
@@ -278,6 +395,7 @@ pub enum FilteredUpdateOneof {
     Pong(SubscribeUpdatePong),                          // 9
     BlockMeta(Arc<MessageBlockMeta>),                   // 7
     Entry(FilteredUpdateEntry),                         // 8
+    EntryUpdateParent(Arc<MessageEntryUpdateParent>),   // 13
     BlockFooter(Arc<MessageBlockFooter>),               // 12
 }
 
@@ -338,6 +456,7 @@ impl FilteredUpdateOneof {
 impl prost::Message for FilteredUpdateOneof {
     fn encode_raw(&self, buf: &mut impl BufMut) {
         match self {
+            Self::EntryUpdateParent(msg) => message::encode(13u32, &msg.update_parent, buf),
             Self::Account(msg) => message::encode(2u32, msg, buf),
             Self::Slot(msg) => message::encode(3u32, msg, buf),
             Self::Transaction(msg) => message::encode(4u32, msg, buf),
@@ -356,6 +475,7 @@ impl prost::Message for FilteredUpdateOneof {
 
     fn encoded_len(&self) -> usize {
         match self {
+            Self::EntryUpdateParent(msg) => message::encoded_len(13u32, &msg.update_parent),
             Self::Account(msg) => message::encoded_len(2u32, msg),
             Self::Slot(msg) => message::encoded_len(3u32, msg),
             Self::Transaction(msg) => message::encoded_len(4u32, msg),
@@ -975,6 +1095,7 @@ impl FilteredUpdateDeshred {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilteredUpdateDeshredOneof {
+    DeshredUpdateParent(Arc<MessageDeshredUpdateParent>), // tag 7
     DeshredTransaction(FilteredUpdateDeshredTransaction), // tag 2
     Ping,                                                 // tag 3
     Pong(SubscribeUpdatePong),                            // tag 4
@@ -1000,6 +1121,7 @@ impl FilteredUpdateDeshredOneof {
 impl prost::Message for FilteredUpdateDeshredOneof {
     fn encode_raw(&self, buf: &mut impl BufMut) {
         match self {
+            Self::DeshredUpdateParent(msg) => message::encode(7u32, &msg.update_parent, buf),
             Self::DeshredTransaction(msg) => message::encode(2u32, msg, buf),
             Self::Ping => {
                 encode_key(3u32, WireType::LengthDelimited, buf);
@@ -1012,6 +1134,7 @@ impl prost::Message for FilteredUpdateDeshredOneof {
 
     fn encoded_len(&self) -> usize {
         match self {
+            Self::DeshredUpdateParent(msg) => message::encoded_len(7u32, &msg.update_parent),
             Self::DeshredTransaction(msg) => message::encoded_len(2u32, msg),
             Self::Ping => key_len(3u32) + encoded_len_varint(0),
             Self::Pong(msg) => message::encoded_len(4u32, msg),
@@ -1042,6 +1165,8 @@ pub struct FilteredUpdateBlock {
     pub accounts: Vec<Arc<MessageAccount>>,
     pub accounts_data_slice: FilterAccountsDataSlice,
     pub entries: Vec<Arc<MessageEntry>>,
+    pub accounts_data_len: usize,
+    pub transactions_data_len: usize,
 }
 
 impl prost::Message for FilteredUpdateBlock {
@@ -1277,22 +1402,24 @@ pub mod tests {
     use crate::plugin::{
         filter::{
             encoder::{AccountEncoder, TransactionEncoder},
+            fixtures,
             message::{FilteredUpdateAccount, FilteredUpdateTransaction},
         },
-        message::{MessageSlot, SlotStatus},
+        message::{MessageBlockFooter, MessageSlot, SlotStatus},
     };
     #[cfg(test)]
-    use yellowstone_grpc_proto::geyser::SubscribeUpdate;
+    use yellowstone_grpc_proto::geyser::{SubscribeUpdate, SubscribeUpdateBlockFooter};
     use {
         super::{FilteredUpdateBlock, FilteredUpdateFilters},
         crate::plugin::{
             convert_to,
             filter::{name::FilterName, FilterAccountsDataSlice},
             message::{
-                MessageAccount, MessageAccountInfo, MessageBlockFooter, MessageBlockMeta,
-                MessageEntry, MessageTransaction, MessageTransactionInfo,
+                MessageAccount, MessageAccountInfo, MessageBlockMeta, MessageEntry,
+                MessageTransaction, MessageTransactionInfo,
             },
         },
+        agave_geyser_plugin_interface::transaction_status_meta as mirror,
         bytes::Bytes,
         foldhash::{HashSet as FoldHashSet, HashSetExt},
         prost::Message,
@@ -1301,7 +1428,10 @@ pub mod tests {
         solana_pubkey::Pubkey,
         solana_signature::Signature,
         solana_storage_proto::convert::generated,
-        solana_transaction_status::{ConfirmedBlock, TransactionWithStatusMeta},
+        solana_transaction_status::{
+            ConfirmedBlock, Reward, TransactionStatusMeta, TransactionTokenBalance,
+            TransactionWithStatusMeta,
+        },
         std::{
             collections::HashMap,
             fs,
@@ -1310,7 +1440,7 @@ pub mod tests {
             sync::{Arc, OnceLock},
             time::SystemTime,
         },
-        yellowstone_grpc_proto::geyser::{SubscribeUpdateBlockFooter, SubscribeUpdateBlockMeta},
+        yellowstone_grpc_proto::{geyser::SubscribeUpdateBlockMeta, prelude as proto},
     };
 
     pub fn create_message_filters(names: &[&str]) -> FilteredUpdateFilters {
@@ -1475,7 +1605,7 @@ pub mod tests {
                                 signature: tx.transaction.signatures[0],
                                 is_vote: true,
                                 transaction: convert_to::create_transaction(&tx.transaction),
-                                meta: convert_to::create_transaction_meta(&tx.meta),
+                                meta: create_transaction_meta(&tx.meta),
                                 index,
                                 account_keys: FoldHashSet::new(),
                                 pre_encoded: OnceLock::new(),
@@ -1499,10 +1629,7 @@ pub mod tests {
                         slot,
                         parent_blockhash: block.previous_blockhash,
                         blockhash: block.blockhash,
-                        rewards: Some(convert_to::create_rewards_obj(
-                            &block.rewards,
-                            block.num_partitions,
-                        )),
+                        rewards: Some(create_rewards_obj(&block.rewards, block.num_partitions)),
                         block_time: block.block_time.map(convert_to::create_timestamp),
                         block_height: block.block_height.map(convert_to::create_block_height),
                         executed_transaction_count: transactions.len() as u64,
@@ -1512,8 +1639,7 @@ pub mod tests {
                     created_at: Timestamp::from(SystemTime::now()),
                 };
                 let mut block_meta2 = block_meta1.clone();
-                block_meta2.rewards =
-                    Some(convert_to::create_rewards_obj(&block.rewards, Some(42)));
+                block_meta2.rewards = Some(create_rewards_obj(&block.rewards, Some(42)));
 
                 let block_meta1 = Arc::new(block_meta1);
                 let block_meta2 = Arc::new(block_meta2);
@@ -1541,6 +1667,8 @@ pub mod tests {
                                 accounts: accounts.clone(),
                                 accounts_data_slice: data_slice.clone(),
                                 entries: entries.clone(),
+                                accounts_data_len: 0,
+                                transactions_data_len: 0,
                             },
                             FilteredUpdateBlock {
                                 meta: Arc::clone(&block_meta2),
@@ -1549,11 +1677,116 @@ pub mod tests {
                                 accounts: accounts.clone(),
                                 accounts_data_slice: data_slice,
                                 entries: entries.clone(),
+                                accounts_data_len: 0,
+                                transactions_data_len: 0,
                             },
                         ]
                     })
             })
             .collect()
+    }
+
+    // Fixtures decode to owned `solana_transaction_status` types. These borrow them as the geyser
+    // interface mirror, as `solana-geyser-plugin-manager` does, then run the plugin conversion.
+    fn create_transaction_meta(meta: &TransactionStatusMeta) -> proto::TransactionStatusMeta {
+        let inner_instruction_rows = meta.inner_instructions.as_ref().map(|groups| {
+            groups
+                .iter()
+                .map(|group| {
+                    let instructions = group
+                        .instructions
+                        .iter()
+                        .map(|ix| mirror::InnerInstruction {
+                            instruction: &ix.instruction,
+                            stack_height: ix.stack_height,
+                        })
+                        .collect::<Vec<_>>();
+                    (group.index, instructions)
+                })
+                .collect::<Vec<_>>()
+        });
+        let inner_instructions = inner_instruction_rows.as_ref().map(|rows| {
+            rows.iter()
+                .map(|(index, instructions)| mirror::InnerInstructions {
+                    index: *index,
+                    instructions,
+                })
+                .collect::<Vec<_>>()
+        });
+        let log_messages = meta
+            .log_messages
+            .as_ref()
+            .map(|logs| logs.iter().map(String::as_str).collect::<Vec<_>>());
+        let pre_token_balances = meta.pre_token_balances.as_ref().map(|balances| {
+            balances
+                .iter()
+                .map(mirror_token_balance)
+                .collect::<Vec<_>>()
+        });
+        let post_token_balances = meta.post_token_balances.as_ref().map(|balances| {
+            balances
+                .iter()
+                .map(mirror_token_balance)
+                .collect::<Vec<_>>()
+        });
+        let rewards = meta
+            .rewards
+            .as_ref()
+            .map(|rewards| rewards.iter().map(mirror_reward).collect::<Vec<_>>());
+
+        convert_to::create_transaction_meta(&mirror::TransactionStatusMeta {
+            status: meta.status.as_ref().copied(),
+            fee: meta.fee,
+            pre_balances: &meta.pre_balances,
+            post_balances: &meta.post_balances,
+            inner_instructions: inner_instructions.as_deref(),
+            log_messages: log_messages.as_deref(),
+            pre_token_balances: pre_token_balances.as_deref(),
+            post_token_balances: post_token_balances.as_deref(),
+            rewards: rewards.as_deref(),
+            loaded_addresses: &meta.loaded_addresses,
+            return_data: meta.return_data.as_ref().map(|return_data| {
+                mirror::TransactionReturnData {
+                    program_id: return_data.program_id,
+                    data: &return_data.data,
+                }
+            }),
+            compute_units_consumed: meta.compute_units_consumed,
+            cost_units: meta.cost_units,
+        })
+    }
+
+    fn create_rewards_obj(rewards: &[Reward], num_partitions: Option<u64>) -> proto::Rewards {
+        let rewards = rewards.iter().map(mirror_reward).collect::<Vec<_>>();
+        convert_to::create_rewards_obj(&rewards, num_partitions)
+    }
+
+    fn mirror_token_balance(
+        balance: &TransactionTokenBalance,
+    ) -> mirror::TransactionTokenBalance<'_> {
+        mirror::TransactionTokenBalance {
+            account_index: balance.account_index,
+            mint: &balance.mint,
+            ui_token_amount: mirror::UiTokenAmount {
+                ui_amount: balance.ui_token_amount.ui_amount,
+                decimals: balance.ui_token_amount.decimals,
+                amount: &balance.ui_token_amount.amount,
+                ui_amount_string: &balance.ui_token_amount.ui_amount_string,
+            },
+            owner: &balance.owner,
+            program_id: &balance.program_id,
+        }
+    }
+
+    fn mirror_reward(reward: &Reward) -> mirror::Reward<'_> {
+        mirror::Reward {
+            pubkey: &reward.pubkey,
+            lamports: reward.lamports,
+            post_balance: reward.post_balance,
+            reward_type: reward.reward_type,
+            commission: reward.commission,
+            commission_bps: reward.commission_bps,
+        }
     }
 
     #[cfg(test)]
@@ -1830,11 +2063,22 @@ pub mod tests {
 
     #[test]
     fn test_message_block_footer() {
-        // An empty user agent and a maximal timestamp are the interesting edges
-        // for the hand-rolled encoder.
-        for (bank_hash, nanos, user_agent) in [
-            (vec![0u8; 32], 0u64, Vec::new()),
-            (vec![7u8; 32], u64::MAX, b"agave/3.0.0".to_vec()),
+        // An empty user agent, a maximal timestamp, absent certificates and an
+        // empty bitmap are the interesting edges for the hand-rolled encoder.
+        let (final_cert, skip_cert, notar_cert) = fixtures::block_footer_certificates();
+        for (
+            bank_hash,
+            nanos,
+            user_agent,
+            (block_final_cert, skip_reward_cert, notar_reward_cert),
+        ) in [
+            (vec![0u8; 32], 0u64, Vec::new(), (None, None, None)),
+            (
+                vec![7u8; 32],
+                u64::MAX,
+                b"agave/3.0.0".to_vec(),
+                (Some(final_cert), Some(skip_cert), Some(notar_cert)),
+            ),
         ] {
             let message = Arc::new(MessageBlockFooter {
                 block_footer: SubscribeUpdateBlockFooter {
@@ -1843,6 +2087,9 @@ pub mod tests {
                     bank_hash,
                     block_producer_time_nanos: nanos,
                     block_user_agent: user_agent,
+                    block_final_cert,
+                    skip_reward_cert,
+                    notar_reward_cert,
                 },
                 created_at: Timestamp::default(),
             });

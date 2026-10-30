@@ -1,7 +1,8 @@
 use {
     futures::stream::{Stream, StreamExt},
     std::{
-        collections::{HashMap, HashSet, VecDeque},
+        collections::{BTreeMap, HashMap, HashSet, VecDeque},
+        hash::{DefaultHasher, Hash, Hasher},
         task::Poll,
     },
     tonic::Status,
@@ -15,21 +16,167 @@ use {
     },
 };
 
+#[derive(Default)]
+pub(crate) struct CompleteBankDedup {
+    complete: HashMap<crate::BankRef, String>,
+    replay_hashes: HashMap<u64, HashSet<String>>,
+    replay: HashMap<crate::BankRef, BankReplay>,
+    statuses: HashMap<(u64, String), HashSet<i32>>,
+}
+
+enum BankReplay {
+    Pending(VecDeque<SubscribeUpdate>),
+    Duplicate(String),
+    Changed,
+}
+
+impl CompleteBankDedup {
+    pub(crate) fn is_complete(&self, bank: &crate::BankRef) -> bool {
+        self.complete.contains_key(bank)
+    }
+
+    /// Forget completion state below the replay boundary. A reconnect never replays those
+    /// slots, so their hashes and statuses are never compared again.
+    pub(crate) fn prune_before(&mut self, boundary: u64) {
+        self.complete.retain(|bank, _| bank.slot >= boundary);
+        self.statuses
+            .retain(|(bank_slot, _), _| *bank_slot >= boundary);
+    }
+
+    pub(crate) fn begin_replay(&mut self, partial: &[crate::BankRef]) {
+        self.replay_hashes.clear();
+        let partial_slots: HashSet<_> = partial.iter().map(|bank| bank.slot).collect();
+        for (bank, hash) in &self.complete {
+            if !partial_slots.contains(&bank.slot) {
+                self.replay_hashes
+                    .entry(bank.slot)
+                    .or_default()
+                    .insert(hash.clone());
+            }
+        }
+        self.replay.clear();
+    }
+
+    pub(crate) fn delivered(&mut self, bank: crate::BankRef, update: &SubscribeUpdate) {
+        match update.update_oneof.as_ref() {
+            Some(UpdateOneof::BlockMeta(meta)) if !meta.blockhash.is_empty() => {
+                self.complete.insert(bank, meta.blockhash.clone());
+            }
+            Some(UpdateOneof::Slot(status)) => {
+                if let Some(hash) = self.complete.get(&bank) {
+                    self.statuses
+                        .entry((bank.slot, hash.clone()))
+                        .or_default()
+                        .insert(status.status);
+                }
+            }
+            Some(
+                UpdateOneof::Account(_)
+                | UpdateOneof::Transaction(_)
+                | UpdateOneof::Entry(_)
+                | UpdateOneof::TransactionStatus(_)
+                | UpdateOneof::Block(_)
+                | UpdateOneof::BlockFooter(_),
+            ) => {
+                // Payloads after BlockMeta invalidate that bank's completion marker.
+                self.complete.remove(&bank);
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn filter(
+        &mut self,
+        generation: u64,
+        update: SubscribeUpdate,
+        ready: &mut VecDeque<SubscribeUpdate>,
+    ) {
+        let Some(bank) = crate::BankRef::from_update(generation, &update) else {
+            ready.push_back(update);
+            return;
+        };
+        let Some(hashes) = self.replay_hashes.get(&bank.slot) else {
+            ready.push_back(update);
+            return;
+        };
+        let replay = self
+            .replay
+            .entry(bank)
+            .or_insert_with(|| BankReplay::Pending(VecDeque::new()));
+        match replay {
+            BankReplay::Changed => ready.push_back(update),
+            BankReplay::Duplicate(hash) => {
+                let hash = hash.clone();
+                self.new_statuses(bank.slot, &hash, std::iter::once(update), ready);
+            }
+            BankReplay::Pending(buffered) => {
+                let hash = match update.update_oneof.as_ref() {
+                    Some(UpdateOneof::BlockMeta(meta)) => Some(meta.blockhash.clone()),
+                    _ => None,
+                };
+                buffered.push_back(update);
+                if let Some(hash) = hash {
+                    let mut buffered = std::mem::take(buffered);
+                    if hashes.contains(&hash) {
+                        *replay = BankReplay::Duplicate(hash.clone());
+                        self.complete.insert(bank, hash.clone());
+                        self.new_statuses(bank.slot, &hash, buffered, ready);
+                    } else {
+                        *replay = BankReplay::Changed;
+                        ready.append(&mut buffered);
+                    }
+                }
+            }
+        }
+    }
+
+    fn new_statuses(
+        &mut self,
+        slot: u64,
+        hash: &str,
+        buffered: impl IntoIterator<Item = SubscribeUpdate>,
+        ready: &mut VecDeque<SubscribeUpdate>,
+    ) {
+        let seen = self.statuses.entry((slot, hash.to_owned())).or_default();
+        ready.extend(
+            buffered
+                .into_iter()
+                .filter(|update| match update.update_oneof.as_ref() {
+                    Some(UpdateOneof::Slot(status)) => {
+                        matches!(
+                            status.status(),
+                            SlotStatus::SlotConfirmed | SlotStatus::SlotFinalized
+                        ) && seen.insert(status.status)
+                    }
+                    _ => false,
+                }),
+        );
+    }
+}
+
 pub const DEFAULT_SLOT_RETENTION: usize = 250;
 
 const CREATED_BANK_STATUS: i32 = SlotStatus::SlotCreatedBank as i32;
+
+/// A slot status and the bank it names. FirstShredReceived, Completed and Dead have no bank.
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+struct BankStatus {
+    status: i32,
+    bank_id: Option<u64>,
+}
 
 pub(crate) enum Observation {
     New,
     Duplicate,
     Replay,
     ReplayComplete { same: bool },
+    PartialReplayComplete { keys: HashSet<DedupKey> },
 }
 
 #[derive(Debug, Clone)]
 struct SealedSlot {
     blockhash: Option<String>,
-    statuses: HashSet<i32>,
+    statuses: HashSet<BankStatus>,
 }
 
 struct ReplayBuffer<T> {
@@ -49,6 +196,14 @@ impl<T> ReplayBuffer<T> {
         self.quarantine.entry(slot).or_default().push(msg);
     }
 
+    fn prune(&mut self, state: &DedupState) {
+        if self.quarantine.is_empty() {
+            return;
+        }
+        self.quarantine
+            .retain(|slot, _| state.slots.contains_key(slot));
+    }
+
     fn flush(&mut self, slot: u64, blockmeta: T) {
         if let Some(buffered) = self.quarantine.remove(&slot) {
             self.flush_queue.extend(buffered);
@@ -65,8 +220,29 @@ impl<T> ReplayBuffer<T> {
     }
 }
 
+impl<T: Dedupable> ReplayBuffer<T> {
+    fn reconcile(&mut self, slot: u64, mut keys: HashSet<DedupKey>, blockmeta: T) {
+        if let Some(buffered) = self.quarantine.remove(&slot) {
+            self.flush_queue.extend(
+                buffered
+                    .into_iter()
+                    .filter(|msg| msg.extract_key().is_none_or(|(_, key)| keys.insert(key))),
+            );
+        }
+        self.flush_queue.push_back(blockmeta);
+    }
+}
+
 pub trait ReconnectCounter {
     fn reconnect_count(&self) -> u32;
+
+    /// Inclusive replay boundary requested for the active replacement connection.
+    fn replay_from_slot(&self) -> Option<u64> {
+        None
+    }
+
+    /// Every slot below `slot` is settled, so a later reconnect does not need to replay it.
+    fn settle_before(&mut self, _slot: u64) {}
 }
 
 /// Wrapper stream that filters out duplicate subscribe updates.
@@ -109,28 +285,36 @@ where
                 Poll::Ready(Some(Ok(msg))) => {
                     let count = this.inner.reconnect_count();
                     if count != this.last_reconnect_count {
+                        this.replay = ReplayBuffer::new();
                         this.state.prepare_for_replay();
                         this.last_reconnect_count = count;
                     }
 
                     match msg.extract_key() {
                         None => return Poll::Ready(Some(Ok(msg))),
-                        Some((slot, key)) => match this.state.observe(slot, key) {
-                            Observation::New => return Poll::Ready(Some(Ok(msg))),
-                            Observation::Duplicate => continue,
-                            Observation::Replay => {
-                                this.replay.hold(slot, msg);
-                                continue;
+                        Some((slot, key)) => {
+                            let observation = this.state.observe(slot, key);
+                            this.replay.prune(&this.state);
+                            match observation {
+                                Observation::New => return Poll::Ready(Some(Ok(msg))),
+                                Observation::Duplicate => continue,
+                                Observation::Replay => {
+                                    this.replay.hold(slot, msg);
+                                    continue;
+                                }
+                                Observation::ReplayComplete { same: true } => {
+                                    this.replay.discard(slot);
+                                    continue;
+                                }
+                                Observation::ReplayComplete { same: false } => {
+                                    this.replay.flush(slot, msg);
+                                    continue;
+                                }
+                                Observation::PartialReplayComplete { keys } => {
+                                    this.replay.reconcile(slot, keys, msg)
+                                }
                             }
-                            Observation::ReplayComplete { same: true } => {
-                                this.replay.discard(slot);
-                                continue;
-                            }
-                            Observation::ReplayComplete { same: false } => {
-                                this.replay.flush(slot, msg);
-                                continue;
-                            }
-                        },
+                        }
                     }
                 }
                 other => return other,
@@ -139,15 +323,29 @@ where
     }
 }
 
+impl<S: ReconnectCounter, T> ReconnectCounter for DedupStream<S, T> {
+    fn reconnect_count(&self) -> u32 {
+        self.inner.reconnect_count()
+    }
+
+    fn replay_from_slot(&self) -> Option<u64> {
+        self.inner.replay_from_slot()
+    }
+
+    fn settle_before(&mut self, slot: u64) {
+        self.inner.settle_before(slot);
+    }
+}
+
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub(crate) enum DedupKey {
-    Slot(i32),                           // status
-    Account([u8; 32], Option<[u8; 64]>), // pubkey, txn_signature
-    Transaction(u64),                    // index
-    TransactionStatus(u64),              // index
-    Entry(u64),                          // index
-    BlockMeta(String),                   // blockhash,
-    BlockFooter(u64),                    // bank_id
+    Slot(i32, Option<u64>),                           // status, bank_id
+    Account([u8; 32], Option<[u8; 64]>, Option<u64>), // pubkey, txn_signature, content hash
+    Transaction(u64),                                 // index
+    TransactionStatus(u64),                           // index
+    Entry(u64),                                       // index
+    BlockMeta(String),                                // blockhash,
+    BlockFooter(u64),                                 // bank_id
     Block(u64),
     DeshredTransaction([u8; 64]), // signature
 }
@@ -155,24 +353,28 @@ pub(crate) enum DedupKey {
 #[derive(Debug, Default, Clone)]
 struct SlotState {
     keys: HashSet<DedupKey>, // inflight_slots[slot]
-    statuses: HashSet<i32>,  // inflight_slot_statuses[slot] + slot_processed[slot]
+    replaying: bool,
+    statuses: HashSet<BankStatus>, // inflight_slot_statuses[slot] + slot_processed[slot]
+}
+
+/// A tracked slot is inflight until its BlockMeta seals it.
+#[derive(Debug, Clone)]
+enum TrackedSlot {
+    Inflight(SlotState),
+    Sealed(SealedSlot),
 }
 
 #[derive(Debug, Clone)]
 /// Tracks seen messages per slot so we can filter duplicates during replay after reconnect.
 pub struct DedupState {
-    inflight: HashMap<u64, SlotState>,
-    sealed: HashMap<u64, SealedSlot>,
-    slot_order: VecDeque<u64>,
+    slots: BTreeMap<u64, TrackedSlot>,
     slot_retention: usize,
 }
 
 impl Default for DedupState {
     fn default() -> Self {
         Self {
-            inflight: Default::default(),
-            sealed: Default::default(),
-            slot_order: Default::default(),
+            slots: Default::default(),
             slot_retention: DEFAULT_SLOT_RETENTION,
         }
     }
@@ -187,7 +389,7 @@ impl Dedupable for SubscribeUpdate {
     fn extract_key(&self) -> Option<(u64, DedupKey)> {
         let oneof = self.update_oneof.as_ref()?;
         match oneof {
-            UpdateOneof::Slot(m) => Some((m.slot, DedupKey::Slot(m.status))),
+            UpdateOneof::Slot(m) => Some((m.slot, DedupKey::Slot(m.status, m.bank_id))),
             UpdateOneof::Account(m) => {
                 let info = m.account.as_ref()?;
                 let pubkey = <[u8; 32]>::try_from(info.pubkey.as_slice()).ok()?;
@@ -196,7 +398,24 @@ impl Dedupable for SubscribeUpdate {
                     .txn_signature
                     .as_ref()
                     .and_then(|s| <[u8; 64]>::try_from(s.as_slice()).ok());
-                Some((m.slot, DedupKey::Account(pubkey, sig)))
+                // A transaction writes an account once, so pubkey and signature identify a
+                // write on any provider. Writes without a signature, such as the two Clock
+                // sysvar writes per slot on Alpenglow, are told apart by their content:
+                // write_version would also separate them, but it is a per-validator counter
+                // and would not match the same write replayed by another endpoint.
+                let content = sig.is_none().then(|| {
+                    let mut hasher = DefaultHasher::new();
+                    (
+                        info.lamports,
+                        &info.owner,
+                        info.executable,
+                        info.rent_epoch,
+                        &info.data,
+                    )
+                        .hash(&mut hasher);
+                    hasher.finish()
+                });
+                Some((m.slot, DedupKey::Account(pubkey, sig, content)))
             }
             UpdateOneof::Transaction(m) => {
                 let info = m.transaction.as_ref()?;
@@ -210,7 +429,7 @@ impl Dedupable for SubscribeUpdate {
             // One footer per bank, so a fork can produce several in the same slot.
             UpdateOneof::BlockFooter(m) => Some((m.slot, DedupKey::BlockFooter(m.bank_id))),
             UpdateOneof::Block(m) => Some((m.slot, DedupKey::Block(m.slot))),
-            UpdateOneof::Ping(_) | UpdateOneof::Pong(_) => None,
+            UpdateOneof::EntryUpdateParent(_) | UpdateOneof::Ping(_) | UpdateOneof::Pong(_) => None,
         }
     }
 }
@@ -225,8 +444,10 @@ impl Dedupable for SubscribeUpdateDeshred {
                 let sig = <[u8; 64]>::try_from(info.signature.as_slice()).ok()?;
                 Some((m.slot, DedupKey::DeshredTransaction(sig)))
             }
-            DeshredUpdateOneof::Slot(m) => Some((m.slot, DedupKey::Slot(m.status))),
-            DeshredUpdateOneof::Ping(_) | DeshredUpdateOneof::Pong(_) => None,
+            DeshredUpdateOneof::Slot(m) => Some((m.slot, DedupKey::Slot(m.status, m.bank_id))),
+            DeshredUpdateOneof::DeshredUpdateParent(_)
+            | DeshredUpdateOneof::Ping(_)
+            | DeshredUpdateOneof::Pong(_) => None,
         }
     }
 }
@@ -240,41 +461,48 @@ impl DedupState {
         }
     }
 
-    fn slot_mut(&mut self, slot: u64) -> &mut SlotState {
-        if !self.inflight.contains_key(&slot) && !self.sealed.contains_key(&slot) {
-            self.slot_order.push_back(slot);
-        }
-        self.inflight.entry(slot).or_default()
+    fn slot_mut(&mut self, slot: u64) -> &mut TrackedSlot {
+        self.slots
+            .entry(slot)
+            .or_insert_with(|| TrackedSlot::Inflight(SlotState::default()))
     }
 
     /// Classify a message for the dedup/quarantine layer
     pub(crate) fn observe(&mut self, slot: u64, key: DedupKey) -> Observation {
         match key {
-            DedupKey::Slot(status) => {
-                // CreatedBank means a bank was just created for this slot. Wipe any
-                // prior state unconditionally: on first creation this is a near no-op,
-                // on a repeated creation it recovers from a rollback.
-                //
-                // Rollback detection depends on receiving CreatedBank. The server only
-                // emits interslot statuses (CreatedBank, etc.) to filters with
-                // interslot_updates=true (see FilterSlots::get_updates server-side).
-                // Without it this wipe is dormant. That is by design: we do not inject
-                // the interslot flag; the user opts in by accepting the extra traffic.
+            DedupKey::Slot(status, bank_id) => {
+                let key = BankStatus { status, bank_id };
+                // The server only sends CreatedBank to filters with interslot_updates=true, so
+                // without that flag this branch is dormant.
                 if status == CREATED_BANK_STATUS {
-                    self.clear_slot(slot);
+                    // A replay resends the CreatedBank of a bank already seen: a duplicate. Without
+                    // a bank_id two banks look alike, so it stays a reset.
+                    let seen = bank_id.is_some()
+                        && self.slots.get(&slot).is_some_and(|tracked| match tracked {
+                            TrackedSlot::Inflight(state) => state.statuses.contains(&key),
+                            TrackedSlot::Sealed(sealed) => sealed.statuses.contains(&key),
+                        });
+                    if seen {
+                        return Observation::Duplicate;
+                    }
+                    // A new bank wipes prior state, which recovers from a rollback; during
+                    // replay it keeps the partial state so the replay can be reconciled.
+                    let replaying = matches!(
+                        self.slots.get(&slot),
+                        Some(TrackedSlot::Inflight(state)) if state.replaying
+                    );
+                    if !replaying {
+                        self.clear_slot(slot);
+                    }
                 }
 
                 // Sealed slots keep a compressed status set for post-seal dedup
                 // (Confirmed / Finalized arrive after BlockMeta).
-                if let Some(s) = self.sealed.get_mut(&slot) {
-                    if !s.statuses.insert(status) {
-                        return Observation::Duplicate;
-                    }
-                    return Observation::New;
-                }
-
-                let state = self.slot_mut(slot);
-                if !state.statuses.insert(status) {
+                let statuses = match self.slot_mut(slot) {
+                    TrackedSlot::Inflight(state) => &mut state.statuses,
+                    TrackedSlot::Sealed(sealed) => &mut sealed.statuses,
+                };
+                if !statuses.insert(key) {
                     return Observation::Duplicate;
                 }
                 self.prune();
@@ -282,39 +510,40 @@ impl DedupState {
             }
 
             DedupKey::BlockMeta(blockhash) => {
-                // Replayed BlockMeta for a sealed slot: this is the verdict.
-                // Compare the stored blockhash to decide whether the block changed
-                // across the reconnect. If no blockhash is stored (slot was partial
-                // when we disconnected), treat as changed and flush always.
-                if let Some(sealed) = self.sealed.get_mut(&slot) {
-                    let same = sealed.blockhash.as_ref() == Some(&blockhash);
-                    sealed.blockhash = Some(blockhash);
-                    return Observation::ReplayComplete { same };
-                }
+                let tracked = self.slot_mut(slot);
+                let state = match tracked {
+                    // Completed slots use their stored blockhash as the replay verdict.
+                    TrackedSlot::Sealed(sealed) => {
+                        let same = sealed.blockhash.as_ref() == Some(&blockhash);
+                        sealed.blockhash = Some(blockhash);
+                        return Observation::ReplayComplete { same };
+                    }
+                    TrackedSlot::Inflight(state) => std::mem::take(state),
+                };
 
                 // First BlockMeta for this slot: seal it. The SlotState is destroyed;
                 // only the blockhash and statuses survive in the compressed SealedSlot.
-                let state = self.inflight.remove(&slot).unwrap_or_default();
-                self.sealed.insert(
-                    slot,
-                    SealedSlot {
-                        blockhash: Some(blockhash),
-                        statuses: state.statuses,
-                    },
-                );
+                *tracked = TrackedSlot::Sealed(SealedSlot {
+                    blockhash: Some(blockhash),
+                    statuses: state.statuses,
+                });
                 self.prune();
-                Observation::New
+                if state.replaying {
+                    Observation::PartialReplayComplete { keys: state.keys }
+                } else {
+                    Observation::New
+                }
             }
 
             // Accounts, transactions, entries, blocks, etc.
             payload => {
                 // Sealed slot: hold for quarantine. The verdict comes when the
                 // replayed BlockMeta arrives; until then we buffer without deduping.
-                if self.sealed.contains_key(&slot) {
-                    return Observation::Replay;
-                }
-
-                let state = self.slot_mut(slot);
+                let state = match self.slot_mut(slot) {
+                    TrackedSlot::Sealed(_) => return Observation::Replay,
+                    TrackedSlot::Inflight(state) if state.replaying => return Observation::Replay,
+                    TrackedSlot::Inflight(state) => state,
+                };
                 if state.keys.contains(&payload) {
                     return Observation::Duplicate;
                 }
@@ -325,38 +554,24 @@ impl DedupState {
         }
     }
 
-    /// Keeps tracked slots bounded to the retention window.
+    /// Evicts the lowest slots beyond the retention window.
     pub fn prune(&mut self) {
-        while self.slot_order.len() > self.slot_retention {
-            match self.slot_order.pop_front() {
-                Some(slot) => {
-                    self.inflight.remove(&slot);
-                    self.sealed.remove(&slot);
-                }
-                None => break,
+        while self.slots.len() > self.slot_retention {
+            self.slots.pop_first();
+        }
+    }
+
+    /// Preserve partial slots and quarantine their replay until BlockMeta arrives.
+    pub(crate) fn prepare_for_replay(&mut self) {
+        for tracked in self.slots.values_mut() {
+            if let TrackedSlot::Inflight(state) = tracked {
+                state.replaying = true;
             }
         }
     }
 
-    /// Promote all inflight slots to sealed-without-blockhash before replay.
-    /// Replayed content for these slots will be quarantined and flushed at
-    /// BlockMeta (no stored blockhash to compare, so always flush).
-    pub(crate) fn prepare_for_replay(&mut self) {
-        for (slot, state) in self.inflight.drain() {
-            self.sealed.insert(
-                slot,
-                SealedSlot {
-                    blockhash: None,
-                    statuses: state.statuses,
-                },
-            );
-        }
-    }
-
     pub(crate) fn clear_slot(&mut self, slot: u64) {
-        self.inflight.remove(&slot);
-        self.sealed.remove(&slot);
-        self.slot_order.retain(|s| *s != slot);
+        self.slots.remove(&slot);
     }
 }
 
@@ -390,6 +605,215 @@ mod tests {
     impl<S> ReconnectCounter for TestStream<S> {
         fn reconnect_count(&self) -> u32 {
             self.count
+        }
+    }
+
+    struct ReplayTestStream {
+        messages: VecDeque<(u32, SubscribeUpdate)>,
+        count: u32,
+    }
+
+    impl Stream for ReplayTestStream {
+        type Item = Result<SubscribeUpdate, Status>;
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Poll::Ready(self.messages.pop_front().map(|(count, msg)| {
+                self.count = count;
+                Ok(msg)
+            }))
+        }
+    }
+
+    impl ReconnectCounter for ReplayTestStream {
+        fn reconnect_count(&self) -> u32 {
+            self.count
+        }
+    }
+
+    fn replay_stream(messages: Vec<(u32, SubscribeUpdate)>) -> DedupStream<ReplayTestStream> {
+        DedupStream::new(
+            ReplayTestStream {
+                messages: messages.into(),
+                count: 0,
+            },
+            DedupState::default(),
+        )
+    }
+
+    fn entry(slot: u64, index: u64, hash: u8) -> SubscribeUpdate {
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Entry(
+                yellowstone_grpc_proto::prelude::SubscribeUpdateEntry {
+                    slot,
+                    index,
+                    hash: vec![hash; 32],
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_replay_releases_only_unseen_payloads() {
+        let first = entry(10, 0, 1);
+        let second = entry(10, 1, 2);
+        let mut replayed = first.clone();
+        replayed.filters = vec!["different-filter".into()];
+        let meta = make_block_meta_msg(10);
+        let mut stream = replay_stream(vec![
+            (0, first.clone()),
+            (1, replayed),
+            (1, second.clone()),
+            (1, second.clone()),
+            (1, meta.clone()),
+            (2, first.clone()),
+            (2, second.clone()),
+            (2, meta.clone()),
+        ]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert_eq!(stream.next().await.unwrap().unwrap(), second);
+        assert_eq!(stream.next().await.unwrap().unwrap(), meta);
+        assert!(stream.next().await.is_none());
+        assert!(stream.replay.quarantine.is_empty());
+    }
+
+    #[tokio::test]
+    async fn partial_replay_does_not_require_redelivery_of_every_key() {
+        let first = entry(10, 0, 1);
+        let second = entry(10, 1, 2);
+        let mut stream = replay_stream(vec![
+            (0, first.clone()),
+            (1, second.clone()),
+            (1, make_block_meta_msg(10)),
+        ]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert_eq!(stream.next().await.unwrap().unwrap(), second);
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap().update_oneof,
+            Some(UpdateOneof::BlockMeta(_))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_replay_created_bank_preserves_reconciliation() {
+        let created = make_slot_msg(10, CREATED_BANK_STATUS);
+        let first = entry(10, 0, 1);
+        let mut stream = replay_stream(vec![
+            (0, created.clone()),
+            (0, first.clone()),
+            (1, created.clone()),
+            (1, first.clone()),
+            (1, make_block_meta_msg(10)),
+        ]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), created);
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap().update_oneof,
+            Some(UpdateOneof::BlockMeta(_))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn replayed_created_bank_of_a_sealed_bank_is_a_duplicate() {
+        let created = make_slot_msg(10, CREATED_BANK_STATUS);
+        let first = entry(10, 0, 1);
+        let meta = make_block_meta_msg(10);
+        let mut stream = replay_stream(vec![
+            (0, created.clone()),
+            (0, first.clone()),
+            (0, meta.clone()),
+            (1, created.clone()),
+            (1, first.clone()),
+            (1, meta.clone()),
+        ]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), created);
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert_eq!(stream.next().await.unwrap().unwrap(), meta);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn created_bank_of_a_new_bank_resets_a_sealed_slot() {
+        let first = entry(10, 0, 1);
+        let created_again = bank_status(10, CREATED_BANK_STATUS, 11);
+        let mut stream = replay_stream(vec![
+            (0, make_slot_msg(10, CREATED_BANK_STATUS)),
+            (0, first.clone()),
+            (0, make_block_meta_msg(10)),
+            (0, created_again.clone()),
+            (0, first.clone()),
+        ]);
+        for _ in 0..3 {
+            stream.next().await.unwrap().unwrap();
+        }
+        assert_eq!(stream.next().await.unwrap().unwrap(), created_again);
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn partial_replay_waits_for_meta_across_status_updates() {
+        let first = entry(10, 0, 1);
+        let second = entry(10, 1, 2);
+        let status = make_slot_msg(10, SlotStatus::SlotProcessed as i32);
+        let mut stream = replay_stream(vec![
+            (0, first.clone()),
+            (1, first.clone()),
+            (1, second.clone()),
+            (1, status.clone()),
+            (1, make_block_meta_msg(10)),
+        ]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert_eq!(stream.next().await.unwrap().unwrap(), status);
+        assert_eq!(stream.replay.quarantine[&10].len(), 2);
+        assert!(inflight(&stream.state, 10).replaying);
+        assert_eq!(stream.next().await.unwrap().unwrap(), second);
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap().update_oneof,
+            Some(UpdateOneof::BlockMeta(_))
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn interrupted_quarantine_is_discarded_before_retry() {
+        let first = entry(10, 0, 1);
+        let second = entry(10, 1, 2);
+        let mut stream = replay_stream(vec![
+            (0, first.clone()),
+            (1, entry(10, 0, 9)),
+            (1, entry(10, 2, 9)),
+            (2, first.clone()),
+            (2, second.clone()),
+            (2, make_block_meta_msg(10)),
+        ]);
+        assert_eq!(stream.next().await.unwrap().unwrap(), first);
+        assert_eq!(stream.next().await.unwrap().unwrap(), second);
+        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.is_none());
+    }
+
+    fn inflight(dedup: &DedupState, slot: u64) -> &SlotState {
+        match &dedup.slots[&slot] {
+            TrackedSlot::Inflight(state) => state,
+            TrackedSlot::Sealed(_) => panic!("slot {slot} is sealed"),
+        }
+    }
+
+    fn bank_status(slot: u64, status: i32, bank_id: u64) -> SubscribeUpdate {
+        SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot,
+                status,
+                bank_id: Some(bank_id),
+                ..Default::default()
+            })),
+            ..Default::default()
         }
     }
 
@@ -482,6 +906,67 @@ mod tests {
             )),
             created_at: None,
         }
+    }
+
+    fn unsigned_write(slot: u64, data: u8, write_version: u64) -> SubscribeUpdate {
+        let mut msg = make_account_msg(slot);
+        if let Some(UpdateOneof::Account(update)) = &mut msg.update_oneof {
+            let account = update.account.as_mut().expect("test account");
+            account.txn_signature = None;
+            account.data = vec![data; 40].into();
+            account.write_version = write_version;
+        }
+        msg
+    }
+
+    // On Alpenglow the Clock sysvar is written twice per slot with no transaction signature,
+    // once at bank creation and once at the block footer. Keyed by pubkey and signature only,
+    // the second write was dropped as a duplicate.
+    #[test]
+    fn unsigned_writes_with_different_content_are_distinct() {
+        let mut dedup = DedupState::default();
+        assert!(matches!(
+            observe(&mut dedup, &unsigned_write(10, 1, 1)),
+            Observation::New
+        ));
+        assert!(matches!(
+            observe(&mut dedup, &unsigned_write(10, 2, 2)),
+            Observation::New
+        ));
+    }
+
+    // write_version is a per-validator counter, so the same unsigned write replayed by another
+    // endpoint carries a different one and must still be recognised.
+    #[test]
+    fn unsigned_write_from_another_endpoint_is_a_duplicate() {
+        let mut dedup = DedupState::default();
+        assert!(matches!(
+            observe(&mut dedup, &unsigned_write(10, 1, 7)),
+            Observation::New
+        ));
+        assert!(matches!(
+            observe(&mut dedup, &unsigned_write(10, 1, 9_000)),
+            Observation::Duplicate
+        ));
+    }
+
+    // write_version is local to a validator process, so a signed write replayed by another
+    // provider must still be recognised by pubkey and signature alone.
+    #[test]
+    fn signed_writes_dedup_across_write_versions() {
+        let mut dedup = DedupState::default();
+        let mut other_provider = make_account_msg(10);
+        if let Some(UpdateOneof::Account(update)) = &mut other_provider.update_oneof {
+            update.account.as_mut().expect("test account").write_version = 99;
+        }
+        assert!(matches!(
+            observe(&mut dedup, &make_account_msg(10)),
+            Observation::New
+        ));
+        assert!(matches!(
+            observe(&mut dedup, &other_provider),
+            Observation::Duplicate
+        ));
     }
 
     fn observe(dedup: &mut DedupState, msg: &SubscribeUpdate) -> Observation {
@@ -680,38 +1165,89 @@ mod tests {
     }
 
     #[test]
-    fn test_prepare_for_replay_promotes_partial_to_sealed() {
+    fn test_prepare_for_replay_preserves_inflight_state() {
         let mut dedup = DedupState::default();
-
-        // slot 600 is inflight (no BlockMeta yet)
+        let account = make_account_msg(600);
         observe(&mut dedup, &make_slot_msg(600, 0));
+        observe(&mut dedup, &account);
+        let keys = inflight(&dedup, 600).keys.clone();
+        let statuses = inflight(&dedup, 600).statuses.clone();
 
-        // simulate reconnect: promote all inflight to sealed-without-blockhash
-        dedup.prepare_for_replay();
-
-        // replayed payload for the now-sealed slot should be quarantined
-        let account_msg = make_account_msg(600);
-        assert!(matches!(
-            observe(&mut dedup, &account_msg),
-            Observation::Replay
-        ));
+        for _ in 0..2 {
+            dedup.prepare_for_replay();
+            assert!(inflight(&dedup, 600).replaying);
+            assert_eq!(inflight(&dedup, 600).keys, keys);
+            assert_eq!(inflight(&dedup, 600).statuses, statuses);
+            assert!(matches!(observe(&mut dedup, &account), Observation::Replay));
+        }
+        let result = observe(&mut dedup, &make_block_meta_msg(600));
+        let Observation::PartialReplayComplete { keys: delivered } = result else {
+            panic!("partial replay must be reconciled");
+        };
+        assert_eq!(delivered, keys);
+        assert!(matches!(dedup.slots[&600], TrackedSlot::Sealed(_)));
     }
 
     #[test]
-    fn test_partial_slot_always_flushes_on_replay_complete() {
+    fn test_partial_slot_requires_reconciliation_at_blockmeta() {
         let mut dedup = DedupState::default();
 
         // slot 700 is inflight
         observe(&mut dedup, &make_slot_msg(700, 0));
 
-        // promote to sealed without blockhash
         dedup.prepare_for_replay();
 
-        // replayed BlockMeta: no stored hash to compare, always flush
+        // BlockMeta completes the partial slot and requests reconciliation.
         assert!(matches!(
             observe(&mut dedup, &make_block_meta_msg_with_hash(700, "any_hash")),
-            Observation::ReplayComplete { same: false }
+            Observation::PartialReplayComplete { .. }
         ));
+    }
+
+    #[test]
+    fn created_bank_without_bank_id_always_resets() {
+        let mut dedup = DedupState::default();
+        let created = SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Slot(SubscribeUpdateSlot {
+                slot: 900,
+                status: CREATED_BANK_STATUS,
+                bank_id: None,
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            assert!(matches!(observe(&mut dedup, &created), Observation::New));
+            observe(&mut dedup, &make_block_meta_msg(900));
+        }
+    }
+
+    #[test]
+    fn test_block_meta_only_slots_are_pruned() {
+        let mut dedup = DedupState::with_slot_retention(5);
+
+        for slot in 1..=10_000 {
+            observe(&mut dedup, &make_block_meta_msg(slot));
+        }
+
+        assert_eq!(dedup.slots.len(), 5);
+        for slot in 9_996..=10_000 {
+            assert!(matches!(dedup.slots[&slot], TrackedSlot::Sealed(_)));
+        }
+    }
+
+    #[test]
+    fn test_mixed_slots_registered_once() {
+        let mut dedup = DedupState::with_slot_retention(3);
+
+        for slot in 1..=1_000 {
+            if slot % 2 == 0 {
+                observe(&mut dedup, &make_slot_msg(slot, 0));
+            }
+            observe(&mut dedup, &make_block_meta_msg(slot));
+        }
+
+        assert_eq!(dedup.slots.len(), 3);
     }
 
     #[test]

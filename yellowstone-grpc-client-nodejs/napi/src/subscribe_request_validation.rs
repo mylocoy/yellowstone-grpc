@@ -187,6 +187,7 @@ fn contains_reserved_autoreconnect_filter(request: &SubscribeRequest) -> bool {
     || contains_reserved_filter_name(&request.blocks)
     || contains_reserved_filter_name(&request.blocks_meta)
     || contains_reserved_filter_name(&request.entry)
+    || contains_reserved_filter_name(&request.block_footer)
 }
 
 fn validate_memcmp_filter(
@@ -471,7 +472,10 @@ mod tests {
     );
 
     let mut entry = HashMap::new();
-    entry.insert("entry_client".to_string(), SubscribeRequestFilterEntry {});
+    entry.insert(
+      "entry_client".to_string(),
+      SubscribeRequestFilterEntry::default(),
+    );
 
     SubscribeRequest {
       block_footer: Default::default(),

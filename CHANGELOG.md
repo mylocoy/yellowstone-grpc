@@ -10,11 +10,144 @@ The minor version will be incremented upon a breaking change and the patch versi
 
 ## [Unreleased]
 
+- yellowstone-grpc-client 16.0.1
+- yellowstone-grpc-napi 0.3.2
+- @triton-one/yellowstone-grpc@9.0.2
+
+### Fixes
+
+- client: `DedupStream` prunes slots whose first message is a `BlockMeta`. They were sealed without being added to the retention queue, so with a `blocks_meta` filter and no `slots` filter the dedup state grew by one entry per slot until the process ran out of memory. [#925](https://github.com/rpcpool/yellowstone-grpc/pull/925)
+
+## 2026-10-20
+
+- yellowstone-grpc-client 16.0.0
+- yellowstone-grpc-napi 0.3.1
+- @triton-one/yellowstone-grpc@9.0.1
+
+### Breaking
+
+- client: `subscribe_with_reconnect` returns `ReconnectGeyserStream` instead of `ReconnectStream<AutoReconnect<Streaming<SubscribeUpdate>, TonicGrpcConnector>>`. It yields the same `ReconnectEvent`s. `ReconnectStream` is public only with the `test-tools` feature.
+
+### Fixes
+
+- client: `DedupStream` drops a replayed `CreatedBank` of a bank it already delivered. It used to read it as a rollback and forget the bank, so the replayed copy of the block reached the client a second time. A `CreatedBank` of a new bank, or one without a `bank_id`, still resets the slot.
+
+### Misc
+
+- client: `ReconnectGeyserStream`, `ReconnectStream`, `ReconnectEvent` and `BankRef` move from `lib.rs` to the `reconnect_geyser_stream` module. `ReconnectEvent` and `BankRef` keep their crate-root paths.
+- ts-client: `@triton-one/yellowstone-grpc@9.0.1` depends on the napi 0.3.1 binaries, rebuilt against yellowstone-grpc-client 16.0.0 and the current proto.
+- e2e: the reconnect scenarios are faster and no longer fail at random. They cut the first connection after three block metas, mid-bank, instead of on a 4s timer. `reconnect-blockmachine` discards and replaces a partially delivered bank through `ReconnectStream` instead of patching it with `DedupStream`. The bank scenarios narrow their filters to sysvar accounts and vote transactions, and `reconnect-bank-integrity` checks the rebuilt bank against the finalized winner instead of a second full-block stream.
+
+## 2026-10-17
+
+- yellowstone-grpc-geyser 16.1.4
+
+### Misc
+- plugin: update agave dependencies to 4.3.2
+
+## 2026-10-16
+
+- yellowstone-grpc-geyser 16.1.3
+
+### Fixes
+
+- plugin: Processed/Confirmed/Finalized slot statuses now go through the geyser loop, in order with the bank data, `CreatedBank` and `Dead` that agave sent before them. They used to go straight to block reconstruction and could overtake everything still queued in the geyser loop, which broke reconstruction in three ways:
+  - A slot could be lost entirely. `Dead` carries no bank id, so it discards every bank of its slot. When a dead bank was repaired, the replacement bank's Processed could arrive before the `Dead`, and the `Dead` then discarded the replacement too. The slot was never delivered at any commitment.
+  - A duplicate block could be replayed as confirmed. When the winning bank's Confirmed arrived before the losing bank's data, the loser was not discarded, and a Confirmed replay of the slot served both blocks.
+  - A slot could miss its Confirmed. A child's commitment is passed up to its parent through the child's parent slot, which was unknown when the status arrived before the child's data.
+
+  The geyser loop hands these statuses to block reconstruction without broadcasting them, so clients still get each status once.
+- plugin: a bank dumped as a duplicate before it froze no longer stops its replacement from being delivered at Processed. Agave sends no event for such a bank, so it stayed a second candidate for its slot forever, the slot never resolved, and the replacement's block, block meta and Processed status were held back until the replacement reached Confirmed, or forever if it never did. The only bank of a slot that sealed is now taken as the slot's bank.
+- plugin: Processed is delivered per bank. When a duplicate block that was already delivered at Processed is replaced, the replacement is now delivered at Processed too, as soon as it seals and receives its own Processed status. It used to be held back until it reached Confirmed, although its accounts, transactions and entries were already streamed at Processed. A Processed subscriber can therefore get two blocks for one slot, told apart by `bank_id`. Confirmed and Finalized are still delivered once per slot, for the bank that reached them.
+
+### Misc
+
+- deps: update `rustls` to 0.23.46 in `Cargo.lock`.
+- deny: drop the `RUSTSEC-2026-0009` ignore. `time` is now 0.3.55 and the toolchain is above the Rust 1.88 the fix needed.
+- Add `.claude/rules/geyser-ordering.md`, a reference for the order agave 4.3 delivers geyser callbacks in, for Claude Code. Ignore `.claude/settings.local.json`.
+
+## 2026-10-12
+
+- yellowstone-grpc-geyser 16.1.2
+
+### Fixes
+
+- plugin: a `from_slot` subscription at processed no longer loses the start of a bank that was in progress when the client connected. The client gets that bank whole when it seals, and replay stays sealed-only. A replay with nothing to return no longer ends the subscription.
+
+## 2026-10-07
+
+- yellowstone-grpc-geyser 16.1.1
+
 ### Features
+- plugin: tracking of data load for clients, per message weights, configurable scales and weights per type of message
+
+## 2026-09-29
+
+- yellowstone-grpc-proto 14.0.1
+- yellowstone-grpc-geyser 16.1.0
+- yellowstone-grpc-client 15.0.0
+
+### Breaking
+
+- proto/plugin: block footer certificates are typed proto messages in fields 9, 10 and 11 instead of wincode bytes.
+
+- proto: each `BlockFooterVotesAggregate` carries `signature_kind`, `signature`, `block_id` and the verbatim `signer_bitmap`.
+
+### Features
+
+- plugin: added `convert_from` and `convert_to` helpers between the block footer certificates and the agave types.
+
+- plugin: added block footers to confirmed and finalized subscriptions and `from_slot` replay.
+
+## 2026-09-25
+
+- yellowstone-grpc-proto 14.0.0
+- yellowstone-grpc-geyser 16.0.0
+- yellowstone-grpc-client 14.0.0
+
+### Breaking
+
+- client: `subscribe` and `subscribe_with_request` no longer reconnect, even when a reconnect config is set. Use `subscribe_with_reconnect`, which requires processed commitment and no startup snapshot.
+
+### Features
+
+- client: added `subscribe_with_reconnect`, a bank-aware reconnecting stream. After a reconnect it emits `ReconnectEvent::DiscardBanks` for partially delivered banks, with the finalized winners, before the replacement updates.
 
 - proto/plugin/client: added standalone Alpenglow block footer updates via the `block_footer` filter.
 
+- proto/plugin: added opt-in Alpenglow block footer certificates via `include_certificates`.
+
+- proto/plugin: added Alpenglow entry and deshred update parent messages, opt-in via `include_update_parent` on the entry and deshred transaction filters. Clients that do not set it get no new message types.
+
 - proto/plugin: added `bank_id` to `SubscribeUpdateBlock`, matching `SubscribeUpdateBlockMeta` and `SubscribeUpdateEntry`.
+
+### Fixes
+
+- plugin: `convert_from::create_tx_meta` respects `inner_instructions_none` and `log_messages_none` instead of always returning empty collections.
+- plugin: `convert_from::create_reward` decodes unknown `reward_type` values as `None` instead of failing the whole conversion.
+- plugin: gossip contact info stores the startup replay complete flag even with no subscriber waiting, so `contact info startup replay complete` is logged once instead of on every update.
+- plugin: block reconstruction drops a bank cleared by an Alpenglow update parent, so the replacement bank's block is still delivered when its commitment is inherited from a descendant.
+- client: `subscribe_with_reconnect` resumes after the last finalized slot instead of the first slot of the subscription, so a reconnect later than the server replay window no longer fails with `OutOfRange`.
+- client: `subscribe_with_reconnect` forgets banks at or below the last finalized slot, so a long lived stream no longer fails with `bank tracking limit reached` after 65,536 banks.
+- client: `DedupStream` keys account writes without a transaction signature by their content, so the second Clock sysvar write per slot on Alpenglow is no longer dropped as a duplicate, and the same write replayed by another endpoint is still recognised.
+- client: `DedupStream` reconciles a slot that was only partly delivered before a reconnect and releases only the updates not seen yet, instead of delivering the whole slot again (port of #883 to 4.3).
+- client: `subscribe_with_reconnect` only forgets banks below the replay boundary, so a second reconnect during recovery no longer delivers complete banks between the boundary and the finalized slot twice.
+
+## 2026-09-15
+
+- yellowstone-grpc-client 13.5.1
+
+### Fixes
+
+- client: fix duplicate events when replaying partial slots after reconnect.
+
+### Fixes
+
+- plugin: `convert_from::create_tx_meta` respects `inner_instructions_none` and `log_messages_none` instead of always returning empty collections.
+- plugin: `convert_from::create_reward` decodes unknown `reward_type` values as `None` instead of failing the whole conversion.
+- plugin: block reconstruction drops a bank cleared by an Alpenglow update parent, so the replacement bank's block is still delivered when its commitment is inherited from a descendant.
+- client: `subscribe_with_reconnect` resumes after the last finalized slot instead of the first slot of the subscription, so a reconnect later than the server replay window no longer fails with `OutOfRange`.
+- client: `subscribe_with_reconnect` forgets banks at or below the last finalized slot, so a long lived stream no longer fails with `bank tracking limit reached` after 65,536 banks.
 
 ## 2026-08-31
 
